@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Frontend
+node_modules/
+dist/
+.vite/
+
+# Local data and model caches
+data/documents/*
+!data/documents/.gitkeep
+data/indexes/
+.cache/
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

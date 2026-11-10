@@ -1,20 +1,3 @@
-"""Оценка реранкера на размеченном наборе eval_set.json.
-
-Запуск:
-    python eval_reranker.py                                   # Qwen3-Reranker-0.6B, юридическая инструкция
-    python eval_reranker.py --model Qwen/Qwen3-Reranker-8B
-    python eval_reranker.py --instruction default             # стандартная инструкция из карточки
-    python eval_reranker.py --doc-format section             # без названия документа в тексте фрагмента
-    python eval_reranker.py --limit 3                         # первые 3 вопроса — проверить, что всё запускается
-
-Метрики:
-    nDCG@5   — качество порядка с учётом градаций 2/1/0 (1.0 = идеальный порядок);
-    MRR      — 1 / место первого полностью релевантного фрагмента (метка 2);
-    Hit@1/3  — доля вопросов, где фрагмент с меткой 2 попал в топ-1 / топ-3;
-    s_max    — log-odds лучшего кандидата: по нему решаем, отказывать ли («в базе нет»).
-Все оценки сохраняются в results_*.json — их можно прислать для разбора.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -24,7 +7,8 @@ import statistics
 import time
 from pathlib import Path
 
-from reranker import INSTRUCTION_DEFAULT, INSTRUCTION_LEGAL, Reranker
+from reranker import (INSTRUCTION_DEFAULT, INSTRUCTION_LEGAL, INSTRUCTION_STRICT, RELATIVE_MARGIN,
+                      THRESHOLD_CONFIDENT, THRESHOLD_NO_ANSWER, Reranker, select_from_scores)
 
 
 def dcg(labels: list[int], k: int) -> float:
@@ -41,20 +25,19 @@ def first_hit_rank(ranked_labels: list[int], target: int = 2) -> int | None:
 
 
 def prepare_doc(text: str, doc_format: str) -> str:
-    """Как подать фрагмент реранкеру: целиком, без названия документа или только текст пункта.
-
-    Эксперимент на «доминирование шапки»: когда все кандидаты из одного договора,
-    одинаковая шапка с номером и контрагентом поднимает оценки ВСЕХ его пунктов.
-    """
     if doc_format == "full":
         return text
     header, _, body = text.partition("\n")
     if doc_format == "body":
         return body or text
-    # "section": убрать название документа, оставить «[раздел] п. X» и текст.
     if " · " in header:
         return header.split(" · ", 1)[1] + "\n" + body
     return text
+
+
+def doc_group(text: str) -> str:
+    header = text.split("\n", 1)[0]
+    return header.split(" · ")[0].split(", ч.")[0]
 
 
 def main() -> None:
@@ -62,8 +45,14 @@ def main() -> None:
     parser.add_argument("--data", default="eval_set.json")
     parser.add_argument("--model", default=None, help="по умолчанию Qwen/Qwen3-Reranker-0.6B")
     parser.add_argument("--backend", default="local", choices=["local", "api"])
-    parser.add_argument("--instruction", default="legal",
-                        help="legal | default | любой свой текст на английском")
+    parser.add_argument("--instruction", default="strict",
+                        help="legal | strict | default | любой свой текст на английском")
+    parser.add_argument("--no-answer", type=float, default=THRESHOLD_NO_ANSWER,
+                        help="порог зоны «в базе нет» (log-odds лучшего кандидата)")
+    parser.add_argument("--confident", type=float, default=THRESHOLD_CONFIDENT,
+                        help="порог зоны «уверенный ответ»")
+    parser.add_argument("--margin", type=float, default=RELATIVE_MARGIN,
+                        help="брать кандидатов не хуже лучшего на столько log-odds")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--doc-format", default="full", choices=["full", "section", "body"],
                         help="full — с шапкой документа; section — без названия документа; body — только текст")
@@ -71,7 +60,8 @@ def main() -> None:
     parser.add_argument("--out", default=None, help="куда сохранить оценки (JSON)")
     args = parser.parse_args()
 
-    instruction = {"legal": INSTRUCTION_LEGAL, "default": INSTRUCTION_DEFAULT}.get(
+    instruction = {"legal": INSTRUCTION_LEGAL, "strict": INSTRUCTION_STRICT,
+                   "default": INSTRUCTION_DEFAULT}.get(
         args.instruction, args.instruction
     )
     questions = json.loads(Path(args.data).read_text(encoding="utf-8"))[: args.limit]
@@ -93,6 +83,9 @@ def main() -> None:
         seconds = time.perf_counter() - started
 
         order = sorted(range(len(texts)), key=lambda i: logodds[i], reverse=True)
+        sel = select_from_scores(logodds, [doc_group(t) for t in texts],
+                                 threshold_no_answer=args.no_answer,
+                                 threshold_confident=args.confident, relative_margin=args.margin)
         ranked_labels = [labels[i] for i in order]
         rank = first_hit_rank(ranked_labels)
         answerable = any(labels)
@@ -105,6 +98,8 @@ def main() -> None:
             "s_max": logodds[order[0]],
             "s_gold": max((s for s, l in zip(logodds, labels) if l == 2), default=None),
             "n": len(texts), "seconds": seconds,
+            "zone": sel.zone, "selected": len(sel.indices),
+            "selected_has_answer": any(labels[i] == 2 for i in sel.indices) if answerable else None,
             "top1": texts[order[0]].split("\n")[0][:70],
         })
         saved.append({"id": q["id"], "query": q["query"],
@@ -113,12 +108,12 @@ def main() -> None:
         r = rows[-1]
         ndcg_text = f"{r['ndcg5']:.2f}" if r["ndcg5"] is not None else "  — "
         print(f"{q['id']:4} {q['type'][:18]:18} nDCG@5={ndcg_text} место_ответа={rank or '—':>2} "
-              f"s_max={r['s_max']:+6.2f}  {r['n']:2} канд. {seconds:5.1f} с | топ-1: {r['top1']}")
+              f"s_max={r['s_max']:+6.2f} {r['zone'][:9]:9} {r['n']:2} канд. {seconds:4.1f} с | топ-1: {r['top1']}")
 
     total = time.perf_counter() - started_all
     ans = [r for r in rows if r["answerable"]]
     unans = [r for r in rows if not r["answerable"]]
-    mean = lambda xs: statistics.mean(xs) if xs else float("nan")  # noqa: E731
+    mean = lambda xs: statistics.mean(xs) if xs else float("nan")
 
     print("\n================ ИТОГ ================")
     print(f"Вопросов: {len(rows)} (с ответом {len(ans)}, без ответа {len(unans)})")
@@ -130,7 +125,6 @@ def main() -> None:
     print(f"Время:             {total:.1f} с всего, {mean([r['seconds'] for r in rows]):.2f} с на вопрос, "
           f"{pairs / total:.1f} пар/с")
 
-    # Разделимость «есть ответ / нет ответа» по s_max — основа порога отказа.
     if ans and unans:
         low_ans = min(r["s_max"] for r in ans)
         high_unans = max(r["s_max"] for r in unans)
@@ -140,6 +134,28 @@ def main() -> None:
             print(f"→ Разделимы: порог отказа можно искать между {high_unans:+.2f} и {low_ans:+.2f}")
         else:
             print("→ Пересекаются: одного порога мало, нужна проверка достаточности на стороне LLM")
+
+    print(f"\nЗоны при порогах: «в базе нет» < {args.no_answer:+.1f} ≤ «осторожно» < "
+          f"{args.confident:+.1f} ≤ «уверенно»; отбор: не хуже лучшего на {args.margin}")
+    for title, group in (("С ответом", ans), ("БЕЗ ответа", unans)):
+        counts = {z: sum(r["zone"] == z for r in group) for z in ("no_answer", "uncertain", "confident")}
+        print(f"  {title:11} в базе нет: {counts['no_answer']:2}  осторожно: {counts['uncertain']:2}  "
+              f"уверенно: {counts['confident']:2}")
+    if ans:
+        kept = [r for r in ans if r["zone"] != "no_answer"]
+        print(f"  Нужный фрагмент попал в отбор для LLM: {sum(bool(r['selected_has_answer']) for r in ans)}"
+              f" из {len(ans)}; в среднем отобрано {mean([r['selected'] for r in kept]):.1f} фрагм.")
+        bad = [r["id"] for r in ans if r["zone"] == "no_answer"]
+        risky = [r["id"] for r in unans if r["zone"] == "confident"]
+        if bad:
+            print(f"  ⚠ Ложный отказ (ответ есть, а зона «в базе нет»): {', '.join(bad)}")
+        if risky:
+            print(f"  ⚠ Опасно (ответа нет, а зона «уверенно»): {', '.join(risky)}")
+    if ans and unans:
+        sugg_low = min(r["s_max"] for r in ans) - 0.5
+        sugg_high = max(r["s_max"] for r in unans) + 0.5
+        print(f"  Рекомендация по этому набору: --no-answer {sugg_low:+.1f} --confident {sugg_high:+.1f}"
+              f" (ни одного ложного отказа и ни одного «уверенно» без ответа)")
 
     out = Path(args.out or f"results_{reranker.model_name.split('/')[-1]}_{args.instruction[:10]}_{args.doc_format}.json")
     out.write_text(json.dumps({"model": reranker.model_name, "instruction": instruction, "doc_format": args.doc_format,

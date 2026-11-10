@@ -1,33 +1,18 @@
-"""Реранкер на базе Qwen3-Reranker.
-
-Два режима (backend):
-- "local" — модель с Hugging Face, считается на своём компьютере (Mac: GPU через MPS).
-            Нужны torch и transformers — их НЕТ на платформе хакатона, поэтому
-            они импортируются только внутри этого режима.
-- "api"   — POST {LLM_BASE_URL}/rerank на платформе хакатона (Qwen3 Reranker 8B).
-
-Оценка релевантности Qwen3-Reranker = вероятность, что модель ответит "yes"
-на вопрос «подходит ли документ к запросу»:
-    score = P(yes) / (P(yes) + P(no)) = sigmoid(logit_yes - logit_no)
-"""
-
 from __future__ import annotations
 
 import math
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 
-# ---------------------------------------------------------------- константы
 
-DEFAULT_LOCAL_MODEL = "Qwen/Qwen3-Reranker-0.6B"   # для отладки; финальные метрики — на 8B
-DEFAULT_API_MODEL = "Qwen/Qwen3-Reranker-8B"       # если платформа не передала RERANKER_MODEL
+DEFAULT_LOCAL_MODEL = "Qwen/Qwen3-Reranker-0.6B"
+DEFAULT_API_MODEL = "Qwen/Qwen3-Reranker-8B"
 
-# Стандартная инструкция из карточки модели.
 INSTRUCTION_DEFAULT = (
     "Given a web search query, retrieve relevant passages that answer the query"
 )
-# Инструкция под юридическую задачу кейса (на английском — так советует карточка модели).
 INSTRUCTION_LEGAL = (
     "Given a question from a bank lawyer, judge whether the document (a provision of "
     "Russian law or of an internal company document) directly answers the question or "
@@ -35,7 +20,17 @@ INSTRUCTION_LEGAL = (
     "number and document edition."
 )
 
-# Официальный шаблон Qwen3-Reranker (карточка модели на Hugging Face).
+INSTRUCTION_STRICT = (
+    "Given a question from a bank lawyer, answer yes only if the document contains the "
+    "specific provision that answers the question. A provision from the right contract or "
+    "law that is about a different topic is not relevant. The counterparty name and "
+    "contract number must match the question."
+)
+
+THRESHOLD_NO_ANSWER = 1.8
+THRESHOLD_CONFIDENT = 6.1
+RELATIVE_MARGIN = 4.0
+
 PREFIX = (
     "<|im_start|>system\nJudge whether the Document meets the requirements based on "
     'the Query and the Instruct provided. Note that the answer can only be "yes" or '
@@ -43,41 +38,72 @@ PREFIX = (
 )
 SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
-# Ограничение log-odds, чтобы не получить бесконечность при p = 0 или 1.
 _EPS = 1e-6
 
 
 def prob_to_logodds(p: float) -> float:
-    """Вероятность -> log-odds: ln(p / (1 - p)). Удобнее для порогов, чем p около 0 и 1."""
     p = min(max(p, _EPS), 1 - _EPS)
     return math.log(p / (1 - p))
 
 
 def logodds_to_prob(x: float) -> float:
-    """log-odds -> вероятность (сигмоида)."""
     return 1.0 / (1.0 + math.exp(-x))
 
 
+@dataclass
+class Selection:
+
+    indices: list[int]
+    zone: str
+    best: float
+    scores: list[float] = field(default_factory=list)
+
+
+def select_from_scores(
+    logodds: list[float],
+    groups: list[str] | None = None,
+    min_k: int = 1,
+    max_k: int = 6,
+    max_per_group: int = 3,
+    threshold_no_answer: float = THRESHOLD_NO_ANSWER,
+    threshold_confident: float = THRESHOLD_CONFIDENT,
+    relative_margin: float = RELATIVE_MARGIN,
+) -> Selection:
+    if not logodds:
+        return Selection([], "no_answer", float("-inf"), [])
+    order = sorted(range(len(logodds)), key=lambda i: logodds[i], reverse=True)
+    best = logodds[order[0]]
+    if best < threshold_no_answer:
+        return Selection([], "no_answer", best, list(logodds))
+    zone = "confident" if best >= threshold_confident else "uncertain"
+
+    chosen: list[int] = []
+    per_group: dict[str, int] = {}
+    for i in order:
+        if len(chosen) >= max_k:
+            break
+        good = logodds[i] >= threshold_no_answer and logodds[i] >= best - relative_margin
+        if not good and len(chosen) >= min_k:
+            break
+        g = groups[i] if groups else str(i)
+        if per_group.get(g, 0) >= max_per_group:
+            continue
+        per_group[g] = per_group.get(g, 0) + 1
+        chosen.append(i)
+    return Selection(chosen, zone, best, list(logodds))
+
+
 class RerankerError(RuntimeError):
-    """Реранкер не смог посчитать оценки (например, API недоступен после повторов)."""
+    pass
 
 
 class Reranker:
-    """Оценивает релевантность документов запросу и сортирует их.
-
-    Методы принимают тексты, а возвращают индексы и оценки — метаданные фрагментов
-    (документ, пункт, редакция) остаются у вызывающего кода.
-
-    Пример:
-        reranker = Reranker()                       # локально, Qwen3-Reranker-0.6B
-        reranker.rerank(query, docs, top_n=5)       # [(индекс, оценка), ...]
-    """
 
     def __init__(
         self,
         model_name: str | None = None,
         backend: str = "local",
-        instruction: str = INSTRUCTION_LEGAL,
+        instruction: str = INSTRUCTION_STRICT,
         batch_size: int = 8,
         max_length: int = 8192,
         device: str | None = None,
@@ -94,7 +120,6 @@ class Reranker:
             if backend == "local":
                 model_name = DEFAULT_LOCAL_MODEL
             else:
-                # На платформе имя модели приходит в переменной окружения (Технический регламент).
                 model_name = os.getenv("RERANKER_MODEL") or DEFAULT_API_MODEL
 
         self.model_name = model_name
@@ -105,13 +130,11 @@ class Reranker:
         self.device = device
         self.debug = debug
 
-        # Настройки режима API.
-        self.api_use_template = api_use_template      # оборачивать ли тексты в шаблон Qwen3 самим
+        self.api_use_template = api_use_template
         self.api_timeout = api_timeout
         self.api_max_docs_per_request = api_max_docs_per_request
         self.api_retries = api_retries
 
-        # Лениво загружаемые объекты локального режима.
         self.model = None
         self.tokenizer = None
         self._torch = None
@@ -126,16 +149,10 @@ class Reranker:
             f"device={self.device!r}, batch_size={self.batch_size})"
         )
 
-    # ============================================================ общий интерфейс
 
     def score(
         self, query: str, documents: list[str], as_logodds: bool = False
     ) -> list[float]:
-        """Оценка релевантности каждого документа — в ИСХОДНОМ порядке документов.
-
-        По умолчанию — вероятность от 0 до 1. as_logodds=True — log-odds
-        (ln(p/(1-p))): удобнее для порогов и сравнения близких оценок.
-        """
         if not documents:
             return []
         if self.backend == "local":
@@ -151,30 +168,34 @@ class Reranker:
         top_n: int | None = None,
         as_logodds: bool = False,
     ) -> list[tuple[int, float]]:
-        """Пары (индекс документа, оценка), от самого релевантного. top_n=None — все."""
         scores = self.score(query, documents, as_logodds=as_logodds)
         ranked = sorted(enumerate(scores), key=lambda pair: pair[1], reverse=True)
         return ranked if top_n is None else ranked[:top_n]
 
+    def select(
+        self,
+        query: str,
+        documents: list[str],
+        groups: list[str] | None = None,
+        **kwargs,
+    ) -> Selection:
+        return select_from_scores(self.score(query, documents, as_logodds=True), groups, **kwargs)
+
     def format_pair(self, query: str, document: str) -> str:
-        """Текст пары в формате Qwen3-Reranker (без системного префикса и суффикса)."""
         return f"<Instruct>: {self.instruction}\n<Query>: {query}\n<Document>: {document}"
 
-    # ============================================================ режим "local"
 
     def _pick_device(self) -> str:
         torch = self._torch
         if torch.backends.mps.is_available():
-            return "mps"          # GPU чипов Apple M1–M5
+            return "mps"
         if torch.cuda.is_available():
-            return "cuda"         # видеокарта NVIDIA
+            return "cuda"
         return "cpu"
 
     def _load(self) -> None:
-        """Загружает модель и токенизатор один раз, при первом вызове."""
         if self.model is not None:
             return
-        # Ленивый импорт: на платформе этих библиотек нет, и режим "api" их не требует.
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -182,19 +203,16 @@ class Reranker:
         if self.device is None:
             self.device = self._pick_device()
 
-        # Половинная точность на GPU: вдвое меньше памяти (8B: ~16 ГБ вместо ~32 ГБ).
         dtype = {
             "mps": torch.float16,
             "cuda": torch.bfloat16,
         }.get(self.device, torch.float32)
 
         started = time.perf_counter()
-        # padding_side="left": последний токен каждой строки батча — её настоящий конец,
-        # и именно на нём модель «отвечает» yes/no.
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, padding_side="left")
         try:
             self.model = AutoModelForCausalLM.from_pretrained(self.model_name, dtype=dtype)
-        except TypeError:  # transformers < 4.56 знает этот параметр как torch_dtype
+        except TypeError:
             self.model = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=dtype)
         self.model.to(self.device).eval()
 
@@ -215,7 +233,6 @@ class Reranker:
         torch = self._torch
         pairs = [self.format_pair(query, d) for d in documents]
 
-        # Батчи из текстов похожей длины → меньше «пустых» токенов-заполнителей.
         order = sorted(range(len(pairs)), key=lambda i: len(pairs[i]))
         result = [0.0] * len(pairs)
         room = self.max_length - len(self._prefix_ids) - len(self._suffix_ids)
@@ -235,18 +252,14 @@ class Reranker:
 
             with torch.no_grad():
                 try:
-                    # logits_to_keep=1: считать логиты только для последней позиции
-                    # (иначе [batch × длина × 151 тыс. слов] — гигабайты памяти).
                     logits = self.model(**batch, logits_to_keep=1).logits[:, -1, :]
-                except TypeError:  # старые версии transformers
+                except TypeError:
                     logits = self.model(**batch).logits[:, -1, :]
-            # log-odds = logit("yes") − logit("no"); считаем во float32 ради точности.
             logodds = (logits[:, self._yes_id] - logits[:, self._no_id]).float().tolist()
             for i, value in zip(idx, logodds):
                 result[i] = value
         return result
 
-    # ============================================================ режим "api"
 
     def _api_settings(self) -> tuple[str, str]:
         base = (
@@ -260,7 +273,6 @@ class Reranker:
         return base, key
 
     def _api_texts(self, query: str, documents: list[str]) -> tuple[str, list[str]]:
-        """Тексты для /rerank: как есть или обёрнутые в шаблон Qwen3 (как в примерах vLLM)."""
         if not self.api_use_template:
             return query, documents
         q = f"{PREFIX}<Instruct>: {self.instruction}\n<Query>: {query}\n"
@@ -282,13 +294,13 @@ class Reranker:
                 return response.json()
             except (httpx.TimeoutException, httpx.TransportError, RerankerError) as exc:
                 last_error = exc
-                time.sleep(2**attempt)  # 1, 2, 4 с — ограниченный повтор, как просит регламент
-            except httpx.HTTPStatusError as exc:  # 4xx кроме 429 — повтор не поможет
+                time.sleep(2**attempt)
+            except httpx.HTTPStatusError as exc:
                 raise RerankerError(f"HTTP {exc.response.status_code}: {exc.response.text[:200]}") from exc
         raise RerankerError(f"/rerank не ответил после {self.api_retries} попыток: {last_error}")
 
     def _score_api(self, query: str, documents: list[str]) -> list[float]:
-        import httpx  # есть в requirements платформы
+        import httpx
 
         base, key = self._api_settings()
         q, docs = self._api_texts(query, documents)
@@ -301,7 +313,7 @@ class Reranker:
                     "model": self.model_name,
                     "query": q,
                     "documents": part,
-                    "top_n": len(part),  # нужны оценки ВСЕХ документов, не только лучших
+                    "top_n": len(part),
                 }
                 data = self._post_with_retries(client, base + "/rerank", key, payload)
                 if self.debug:
@@ -314,16 +326,13 @@ class Reranker:
                     if raw is None or not 0 <= i < len(part):
                         continue
                     raw = float(raw)
-                    # Вероятность [0, 1] → log-odds; иначе считаем, что это уже логит.
                     result[start + i] = prob_to_logodds(raw) if 0.0 <= raw <= 1.0 else raw
 
         missing = sum(x is None for x in result)
         if missing:
             raise RerankerError(f"/rerank не вернул оценки для {missing} из {len(result)} документов")
-        return result  # type: ignore[return-value]
+        return result
 
-
-# ---------------------------------------------------------------- быстрая проверка
 
 if __name__ == "__main__":
     query = "Какая арендная плата по договору с ООО «Северный Склад»?"
@@ -339,4 +348,6 @@ if __name__ == "__main__":
     started = time.perf_counter()
     for index, score in reranker.rerank(query, docs):
         print(f"{score:.4f}  (log-odds {prob_to_logodds(score):+.2f})  #{index}: {docs[index][:70]}")
+    selection = reranker.select(query, docs)
+    print(f"Зона: {selection.zone}, лучший log-odds {selection.best:+.2f}, для LLM: {selection.indices}")
     print(f"Время: {time.perf_counter() - started:.1f} с (первый запуск включает загрузку модели)")

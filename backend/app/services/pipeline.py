@@ -3,7 +3,7 @@ from app.models.schemas import QueryRequest, QueryResponse
 from app.services.embeddings import OpenAIEmbeddingProvider
 from app.services.llm import OpenAICompatibleLLM
 from app.services.reranker import CrossEncoderReranker
-from app.services.vector_store import QdrantVectorStore
+from app.services.vector_store import ChromaVectorStore
 
 
 class RAGPipeline:
@@ -11,7 +11,7 @@ class RAGPipeline:
 
     def __init__(self) -> None:
         self.embeddings = OpenAIEmbeddingProvider(settings.embedding_model)
-        self.vector_store = QdrantVectorStore()
+        self.vector_store = ChromaVectorStore()
         self.reranker = CrossEncoderReranker(settings.reranker_model)
         self.llm = OpenAICompatibleLLM(
             base_url=settings.llm_base_url,

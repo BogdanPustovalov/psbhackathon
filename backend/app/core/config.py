@@ -11,9 +11,8 @@ class Settings(BaseSettings):
     api_prefix: str = "/api/v1"
     backend_cors_origins: str = "http://localhost:5173"
 
-    qdrant_url: str = "http://localhost:6333"
-    qdrant_collection: str = "documents"
-    vector_size: int = 1536
+    chroma_persist_directory: str = "./data/chroma"
+    chroma_collection: str = "documents"
 
     embedding_provider: str = "openai"
     embedding_model: str = "text-embedding-3-small"

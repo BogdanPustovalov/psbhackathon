@@ -19,6 +19,7 @@ dist/
 # Local data and model caches
 data/documents/*
 !data/documents/.gitkeep
+data/chroma/
 data/indexes/
 .cache/
 

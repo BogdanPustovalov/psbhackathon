@@ -1,15 +1,20 @@
 import type { Source } from "../api";
 import type { AssistantEntry, ChatEntry } from "../useChat";
+import { AnswerText } from "./AnswerText";
+import { SourceCard } from "./SourceCard";
 
 type Props = {
   entry: ChatEntry;
   disabled: boolean;
   isLast: boolean;
+  activeN: number | null;
   onRetry: (id: string) => void;
   onSend: (text: string) => void;
+  onOpenSource: (entryId: string, source: Source) => void;
 };
 
-export function Message({ entry, disabled, isLast, onRetry, onSend }: Props) {
+export function Message(props: Props) {
+  const { entry } = props;
   if (entry.role === "user") {
     return (
       <div className="message message-user">
@@ -17,10 +22,18 @@ export function Message({ entry, disabled, isLast, onRetry, onSend }: Props) {
       </div>
     );
   }
-  return <AssistantMessage entry={entry} disabled={disabled} isLast={isLast} onRetry={onRetry} onSend={onSend} />;
+  return <AssistantMessage {...props} entry={entry} />;
 }
 
-function AssistantMessage({ entry, disabled, isLast, onRetry, onSend }: Props & { entry: AssistantEntry }) {
+function AssistantMessage({
+  entry,
+  disabled,
+  isLast,
+  activeN,
+  onRetry,
+  onSend,
+  onOpenSource,
+}: Props & { entry: AssistantEntry }) {
   if (entry.error) {
     return (
       <div className="message message-assistant">
@@ -36,11 +49,12 @@ function AssistantMessage({ entry, disabled, isLast, onRetry, onSend }: Props & 
 
   const sources = entry.response?.sources ?? [];
   const clarification = entry.response?.clarification;
+  const open = (source: Source) => onOpenSource(entry.id, source);
 
   return (
     <div className="message message-assistant">
       <div className="bubble">
-        <p className="answer-text">{entry.content}</p>
+        <AnswerText text={entry.content} sources={sources} activeN={activeN} onCite={open} />
 
         {clarification && clarification.options.length > 0 && (
           <div className="clarification">
@@ -63,35 +77,16 @@ function AssistantMessage({ entry, disabled, isLast, onRetry, onSend }: Props & 
 
         {sources.length > 0 && (
           <div className="sources">
-            <p className="sources-title">Источники</p>
+            <p className="sources-title">Источники · {sources.length}</p>
             <ol className="sources-list">
-              {sources.map((source, index) => (
-                <SourceLine key={source.id} source={source} n={source.n ?? index + 1} />
-              ))}
+              {sources.map((source, index) => {
+                const n = source.n ?? index + 1;
+                return <SourceCard key={source.id} source={source} n={n} active={n === activeN} onOpen={open} />;
+              })}
             </ol>
           </div>
         )}
       </div>
     </div>
-  );
-}
-
-function SourceLine({ source, n }: { source: Source; n: number }) {
-  const { doc_title, section, edition } = source.metadata;
-  const expired = edition?.status === "expired";
-  return (
-    <li className="source-line">
-      <span className="source-n">[{n}]</span>
-      <span>
-        {doc_title ?? "Фрагмент"}
-        {section && <span className="muted">, {section}</span>}
-        {edition && (
-          <span className={expired ? "edition edition-expired" : "edition"}>
-            {edition.label}
-            {expired && " · утратила силу"}
-          </span>
-        )}
-      </span>
-    </li>
   );
 }

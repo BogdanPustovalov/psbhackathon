@@ -215,7 +215,10 @@ def load_raw_documents(path: Path) -> list[tuple[str, str]]:
                 log("unreadable document skipped:", name)
                 return
         if text.strip():
-            docs.append((Path(name).name, text.replace("\r\n", "\n").strip()))
+            # keep the folder ("законы/…", "документы компании/…"): it tells the document type
+            parts = [p for p in Path(name).parts if p not in ("", ".")]
+            label = parts[-1] if len(parts) < 2 or "__" in parts[-1] else parts[-2] + "__" + parts[-1]
+            docs.append((label, text.replace("\r\n", "\n").strip()))
 
     if path.is_dir():
         for p in sorted(path.rglob("*")):

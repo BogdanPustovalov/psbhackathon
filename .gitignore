@@ -29,3 +29,7 @@ data/indexes/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Local evaluation runs and built submissions
+runs/
+dist/

@@ -1,70 +1,139 @@
-import { FormEvent, useState } from "react";
-import { askQuestion, QueryResponse } from "./api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { Source } from "./api";
+import { Composer } from "./components/Composer";
+import { DocumentPanel, type PanelView } from "./components/DocumentPanel";
+import { Message } from "./components/Message";
+import { EXAMPLE_QUESTIONS } from "./examples";
+import { useChat } from "./useChat";
+
+const IS_MOCK = import.meta.env.VITE_USE_MOCK === "1";
+
+type ActiveSource = { entryId: string; n: number };
 
 export default function App() {
-  const [question, setQuestion] = useState("");
-  const [result, setResult] = useState<QueryResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  const { entries, pending, send, retry, reset } = useChat();
+  const [panel, setPanel] = useState<PanelView | null>(null);
+  const [active, setActive] = useState<ActiveSource | null>(null);
+  const endRef = useRef<HTMLDivElement>(null);
 
-  async function handleSubmit(event: FormEvent) {
-    event.preventDefault();
-    if (!question.trim()) return;
-
-    setLoading(true);
-    setError("");
-    try {
-      setResult(await askQuestion(question.trim()));
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Неизвестная ошибка");
-    } finally {
-      setLoading(false);
+  // Keep the latest message in view.
+  useEffect(() => {
+    if (entries.length === 0) {
+      endRef.current?.closest(".chat")?.scrollTo({ top: 0 });
+      return;
     }
+    endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [entries.length, pending]);
+
+  const openSource = useCallback((entryId: string, source: Source) => {
+    const { doc_id, section, char_start, char_end } = source.metadata;
+    if (!doc_id) return;
+    const n = source.n ?? 0;
+    setActive({ entryId, n });
+    setPanel({
+      kind: "doc",
+      docId: doc_id,
+      highlight: { text: source.text, start: char_start, end: char_end },
+      caption: [`[${n}]`, section].filter(Boolean).join(" "),
+    });
+  }, []);
+
+  const openDocument = useCallback((docId: string) => {
+    setActive(null);
+    setPanel({ kind: "doc", docId });
+  }, []);
+
+  const showList = useCallback(() => {
+    setActive(null);
+    setPanel({ kind: "list" });
+  }, []);
+
+  const closePanel = useCallback(() => {
+    setActive(null);
+    setPanel(null);
+  }, []);
+
+  function newDialog() {
+    closePanel();
+    reset();
   }
 
   return (
-    <main className="page-shell">
-      <section className="hero">
-        <p className="eyebrow">RAG PLATFORM</p>
-        <h1>Спросите свою базу знаний</h1>
-        <p className="subtitle">
-          Семантический поиск, reranking и ответ LLM с прозрачными источниками.
-        </p>
-
-        <form className="query-form" onSubmit={handleSubmit}>
-          <textarea
-            value={question}
-            onChange={(event) => setQuestion(event.target.value)}
-            placeholder="Например: какие правила описаны в загруженных документах?"
-            rows={4}
-          />
-          <button type="submit" disabled={loading || !question.trim()}>
-            {loading ? "Ищу…" : "Задать вопрос"}
-          </button>
-        </form>
-
-        {error && <p className="error">{error}</p>}
-
-        {result && (
-          <div className="result-card">
-            <h2>Ответ</h2>
-            <p>{result.answer}</p>
-            <h3>Источники</h3>
-            {result.sources.length === 0 ? (
-              <p className="muted">Источники пока не подключены.</p>
-            ) : (
-              <ul>
-                {result.sources.map((source) => (
-                  <li key={source.id}>
-                    <span>{source.text}</span>
-                    <small>score: {source.score.toFixed(3)}</small>
-                  </li>
-                ))}
-              </ul>
-            )}
+    <div className={panel ? "layout layout-with-panel" : "layout"}>
+      <div className="app">
+        <header className="app-header">
+          <div className="app-title">
+            <h1>Юридический ассистент</h1>
           </div>
-        )}
-      </section>
-    </main>
+          <div className="header-actions">
+            {IS_MOCK && <span className="badge">Демо-данные</span>}
+            <button type="button" className="ghost-button" onClick={panel?.kind === "list" ? closePanel : showList}>
+              Документы
+            </button>
+            <button type="button" className="ghost-button" onClick={newDialog} disabled={pending || entries.length === 0}>
+              Новый диалог
+            </button>
+          </div>
+        </header>
+
+        <main className="chat" aria-live="polite">
+          <div className="chat-inner">
+            {entries.length === 0 ? (
+              <EmptyState onPick={send} />
+            ) : (
+              entries.map((entry, index) => (
+                <Message
+                  key={entry.id}
+                  entry={entry}
+                  disabled={pending}
+                  isLast={index === entries.length - 1}
+                  activeN={active?.entryId === entry.id ? active.n : null}
+                  onRetry={retry}
+                  onSend={send}
+                  onOpenSource={openSource}
+                />
+              ))
+            )}
+
+            {pending && (
+              <div className="message message-assistant">
+                <div className="bubble bubble-pending">
+                  Ищу в документах<span className="dots" aria-hidden="true" />
+                </div>
+              </div>
+            )}
+            <div ref={endRef} />
+          </div>
+        </main>
+
+        <footer className="composer-area">
+          <Composer disabled={pending} onSend={send} />
+          <p className="hint muted">Enter — отправить, Shift+Enter — новая строка</p>
+        </footer>
+      </div>
+
+      {panel && (
+        <DocumentPanel view={panel} onOpenDocument={openDocument} onShowList={showList} onClose={closePanel} />
+      )}
+    </div>
+  );
+}
+
+function EmptyState({ onPick }: { onPick: (text: string) => void }) {
+  return (
+    <div className="empty-state">
+      <h2>Чем помочь?</h2>
+      <p className="muted">
+        Спросите о договорах, внутренних регламентах или нормах закона. Ассистент ответит со ссылками на
+        конкретные пункты и честно скажет, если в базе нет нужных документов.
+      </p>
+      <div className="examples">
+        {EXAMPLE_QUESTIONS.map((question) => (
+          <button key={question} type="button" className="example" onClick={() => onPick(question)}>
+            {question}
+          </button>
+        ))}
+      </div>
+    </div>
   );
 }

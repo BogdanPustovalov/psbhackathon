@@ -1,3 +1,5 @@
+from typing import Annotated
+
 from fastapi import APIRouter, Depends
 
 from app.models.schemas import QueryRequest, QueryResponse
@@ -13,6 +15,6 @@ def get_pipeline() -> RAGPipeline:
 @router.post("", response_model=QueryResponse)
 async def query_rag(
     payload: QueryRequest,
-    pipeline: RAGPipeline = Depends(get_pipeline),
+    pipeline: Annotated[RAGPipeline, Depends(get_pipeline)],
 ) -> QueryResponse:
     return await pipeline.answer(payload)

@@ -1,6 +1,7 @@
 import type { Source } from "../api";
 import type { AssistantEntry, ChatEntry } from "../useChat";
 import { AnswerText } from "./AnswerText";
+import { MessageActions } from "./MessageActions";
 import { SourceCard } from "./SourceCard";
 import { ConfidenceBadge, EditionNotice, MissingBlock } from "./TrustSignals";
 
@@ -90,6 +91,8 @@ function AssistantMessage({
             </ol>
           </div>
         )}
+
+        <MessageActions answer={entry.content} sources={sources} elapsedMs={entry.elapsedMs} />
       </div>
     </div>
   );

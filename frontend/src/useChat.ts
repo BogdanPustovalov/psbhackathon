@@ -17,6 +17,8 @@ export type AssistantEntry = {
   content: string;
   response?: QueryResponse;
   error?: string;
+  // How long the answer took, measured in the browser.
+  elapsedMs?: number;
 };
 
 export type ChatEntry = UserEntry | AssistantEntry;
@@ -66,9 +68,16 @@ export function useChat() {
 
   const ask = useCallback(async (question: string, previous: ChatEntry[]) => {
     setPending(true);
+    const started = performance.now();
     try {
       const response = await askQuestion(question, toHistory(previous));
-      const answer: AssistantEntry = { id: newId(), role: "assistant", content: response.answer, response };
+      const answer: AssistantEntry = {
+        id: newId(),
+        role: "assistant",
+        content: response.answer,
+        response,
+        elapsedMs: Math.round(performance.now() - started),
+      };
       setEntries((current) => [...current, answer]);
     } catch (error) {
       const failed: AssistantEntry = { id: newId(), role: "assistant", content: "", error: errorText(error) };

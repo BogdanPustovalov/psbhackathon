@@ -64,7 +64,6 @@ export default function App() {
         <header className="app-header">
           <div className="app-title">
             <h1>Юридический ассистент</h1>
-            <p className="muted">Отвечает только по документам базы знаний и ссылается на них</p>
           </div>
           <div className="header-actions">
             {IS_MOCK && <span className="badge">Демо-данные</span>}

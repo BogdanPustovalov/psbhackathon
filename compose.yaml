@@ -1,0 +1,39 @@
+# Starts the whole assistant with one command:
+#   cp .env.example .env   # then put the API key into .env
+#   docker compose up --build
+# Interface: http://localhost:8080, API: http://localhost:8000/docs
+
+services:
+  backend:
+    build: ./backend
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CHROMA_PERSIST_DIRECTORY: /app/data/chroma
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: /api/v1
+        # 1 = demo answers built into the interface, without the backend.
+        VITE_USE_MOCK: ${FRONTEND_USE_MOCK:-0}
+    environment:
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

@@ -6,8 +6,6 @@ import type { ChatMessage, DocumentDetail, DocumentInfo, QueryResponse, Source }
 import { findDocument, MOCK_DOCUMENTS } from "./documents";
 import { FALLBACK, SCENARIOS, type Scenario, type SourceSpec } from "./scenarios";
 
-export { EXAMPLE_QUESTIONS } from "./scenarios";
-
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function pickScenario(question: string, history: ChatMessage[]): Scenario {

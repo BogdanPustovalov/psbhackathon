@@ -43,6 +43,7 @@ function buildSource(spec: SourceSpec, n: number, scenario: string): Source {
       doc_type: doc.doc_type,
       section: spec.section,
       edition: doc.edition ?? undefined,
+      related: doc.related,
       ...(start >= 0 ? { char_start: start, char_end: start + spec.quote.length } : {}),
     },
   };

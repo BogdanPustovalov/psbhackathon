@@ -2,6 +2,7 @@ import type { Source } from "../api";
 import type { AssistantEntry, ChatEntry } from "../useChat";
 import { AnswerText } from "./AnswerText";
 import { SourceCard } from "./SourceCard";
+import { ConfidenceBadge, EditionNotice, MissingBlock } from "./TrustSignals";
 
 type Props = {
   entry: ChatEntry;
@@ -54,7 +55,10 @@ function AssistantMessage({
   return (
     <div className="message message-assistant">
       <div className="bubble">
+        {entry.response && <ConfidenceBadge response={entry.response} />}
         <AnswerText text={entry.content} sources={sources} activeN={activeN} onCite={open} />
+        <MissingBlock items={entry.response?.missing ?? []} />
+        <EditionNotice sources={sources} />
 
         {clarification && clarification.options.length > 0 && (
           <div className="clarification">

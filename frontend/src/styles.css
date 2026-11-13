@@ -9,6 +9,7 @@
   --accent-soft: rgba(167, 178, 255, 0.12);
   --danger: #ff9eae;
   --warning: #f2c97d;
+  --success: #8fd9a8;
 
   color: var(--text);
   background: var(--bg);
@@ -156,6 +157,41 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   50% { content: ".."; }
   75% { content: "..."; }
 }
+
+/* Trust signals */
+
+.trust-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: help;
+}
+.trust-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.trust-ok { background: rgba(143, 217, 168, 0.12); color: var(--success); }
+.trust-warn { background: rgba(242, 201, 125, 0.12); color: var(--warning); }
+.trust-none { background: rgba(255, 158, 174, 0.1); color: var(--danger); }
+.trust-neutral { background: var(--accent-soft); color: var(--accent); }
+
+.notice {
+  margin-top: 12px;
+  padding: 10px 14px;
+  border-left: 3px solid;
+  border-radius: 8px;
+  font-size: 14px;
+}
+.notice ul { margin: 0; padding-left: 18px; }
+.notice li { margin: 2px 0; }
+.notice-title { margin: 0 0 4px; font-weight: 700; }
+.notice-hint { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+.notice-missing { border-color: var(--danger); background: rgba(255, 158, 174, 0.06); }
+.notice-missing .notice-title { color: var(--danger); }
+.notice-edition { border-color: var(--warning); background: rgba(242, 201, 125, 0.06); }
+.notice-edition .notice-title { color: var(--warning); }
 
 /* Clarifying question */
 

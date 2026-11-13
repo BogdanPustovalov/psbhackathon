@@ -23,6 +23,7 @@ export type SourceMetadata = {
   doc_type?: DocType;
   section?: string;
   edition?: Edition;
+  related?: string[];
   char_start?: number;
   char_end?: number;
   [key: string]: unknown;

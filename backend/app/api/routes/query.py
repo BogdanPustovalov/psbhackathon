@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 from fastapi import APIRouter, Depends
 
 from app.models.schemas import QueryRequest, QueryResponse
@@ -6,6 +8,7 @@ from app.services.pipeline import RAGPipeline
 router = APIRouter(prefix="/query", tags=["query"])
 
 
+@lru_cache(maxsize=1)
 def get_pipeline() -> RAGPipeline:
     return RAGPipeline()
 

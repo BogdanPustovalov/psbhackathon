@@ -1,19 +1,43 @@
 services:
   backend:
-    build: ./backend
-    env_file:
-      - .env
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment:
-      CHROMA_PERSIST_DIRECTORY: /app/data/chroma
+      DATA_HACK_OUTPUT_DIR: /app/data_hack_output
+      LLM_API_KEY: ${LLM_API_KEY:-${OPENAI_API_KEY:-}}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-gpt-6-luna}
+      TEMPERATURE: ${TEMPERATURE:-0}
+      MAX_TOKENS: ${MAX_TOKENS:-1000}
+      EMBEDDING_MODEL_PATH: BAAI/bge-m3
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cpu}
+      TOP_K: ${TOP_K:-50}
+      RRF_TOP_K: ${RRF_TOP_K:-50}
+      RERANKER_CANDIDATES: ${RERANKER_CANDIDATES:-50}
+      RERANKER_TOP_N: ${RERANKER_TOP_N:-50}
+      FINAL_CONTEXT_TOP_K: ${FINAL_CONTEXT_TOP_K:-15}
+      RRF_SEMANTIC_WEIGHT: ${RRF_SEMANTIC_WEIGHT:-0.4}
+      RRF_BM25_WEIGHT: ${RRF_BM25_WEIGHT:-0.6}
+      BM25_LEMMATIZE: ${BM25_LEMMATIZE:-1}
+      RERANKER_ENABLED: ${RERANKER_ENABLED:-true}
+      RERANKER_MODEL: Qwen/Qwen3-Reranker-0.6B
+      RERANKER_DEVICE: ${RERANKER_DEVICE:-cpu}
+      RERANKER_BATCH_SIZE: ${RERANKER_BATCH_SIZE:-2}
+      RERANKER_MAX_LENGTH: ${RERANKER_MAX_LENGTH:-256}
+      HF_HOME: /app/model-cache
     ports:
       - "8000:8000"
     volumes:
-      - ./data:/app/data
+      - ./data_hack_output:/app/data_hack_output:ro
+      - model-cache:/app/model-cache
   frontend:
     build: ./frontend
     environment:
-      VITE_API_URL: http://localhost:8000/api/v1
+      BACKEND_URL: http://backend:8000
     ports:
-      - "5173:5173"
+      - "5173:80"
     depends_on:
       - backend
+volumes:
+  model-cache:

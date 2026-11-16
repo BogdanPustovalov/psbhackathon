@@ -9,18 +9,18 @@ Run from the repository root::
     python -m app.services.rag.diagnostic
 
 The script does not call the LLM. ``Final Context`` is the exact context that
-would be passed to it after conditional protection and adaptive selection.
+would be passed to it after weighted RRF and Qwen reranking.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import sys
-from collections.abc import Callable
 from typing import Any, Iterable, Sequence
 
 
@@ -30,25 +30,14 @@ if __package__ in {None, ""}:
     if package_parent not in sys.path:
         sys.path.insert(0, package_parent)
     from app.services.rag import (
-        BM25_CONFIRM_FAISS_TOP_K,
-        BM25_CONFIRM_RERANKER_SCORE,
-        BM25_CONFIRM_RRF_TOP_K,
-        BM25_PROTECTED_TOP_K,
         BM25_TOP_K,
         BM25_WEIGHT,
-        FAISS_PROTECTED_TOP_K,
         FAISS_TOP_K,
         FAISS_WEIGHT,
         FINAL_CONTEXT_TOP_K,
-        MAX_CONTEXT_TOKENS,
-        MIN_CONTEXT_RELATIVE_SCORE,
-        MIN_CONTEXT_SCORE,
         RERANKER_INPUT_K,
         RERANKER_TOP_K,
-        RERANKER_WEIGHT,
         RRF_TOP_K,
-        RRF_WEIGHT,
-        SOURCE_DIVERSITY_PENALTY,
         Document,
     )
     from app.services.rag.embedding import EmbeddingClient
@@ -66,25 +55,14 @@ if __package__ in {None, ""}:
     from app.services.rag.vector_store import FaissVectorIndex, embed_and_index
 else:
     from . import (
-        BM25_CONFIRM_FAISS_TOP_K,
-        BM25_CONFIRM_RERANKER_SCORE,
-        BM25_CONFIRM_RRF_TOP_K,
-        BM25_PROTECTED_TOP_K,
         BM25_TOP_K,
         BM25_WEIGHT,
-        FAISS_PROTECTED_TOP_K,
         FAISS_TOP_K,
         FAISS_WEIGHT,
         FINAL_CONTEXT_TOP_K,
-        MAX_CONTEXT_TOKENS,
-        MIN_CONTEXT_RELATIVE_SCORE,
-        MIN_CONTEXT_SCORE,
         RERANKER_INPUT_K,
         RERANKER_TOP_K,
-        RERANKER_WEIGHT,
         RRF_TOP_K,
-        RRF_WEIGHT,
-        SOURCE_DIVERSITY_PENALTY,
         Document,
     )
     from .embedding import EmbeddingClient
@@ -167,7 +145,15 @@ def _documents_json(documents: Iterable[Document]) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def collect_diagnostic_row(
+@dataclass(slots=True)
+class DiagnosticResult:
+    """Serialized diagnostics and the exact chunks passed to the LLM."""
+
+    row: dict[str, str]
+    final_hits: list[Document]
+
+
+def collect_diagnostic_result(
     identifier: str,
     question: str,
     index: FaissVectorIndex,
@@ -180,24 +166,9 @@ def collect_diagnostic_row(
     reranker_input_top_k: int = RERANKER_INPUT_K,
     reranker_top_k: int = RERANKER_TOP_K,
     final_context_top_k: int = FINAL_CONTEXT_TOP_K,
-    faiss_protected_top_k: int = FAISS_PROTECTED_TOP_K,
-    bm25_protected_top_k: int = BM25_PROTECTED_TOP_K,
-    faiss_weight: float = FAISS_WEIGHT,
-    bm25_weight: float = BM25_WEIGHT,
-    rrf_weight: float = RRF_WEIGHT,
-    reranker_weight: float = RERANKER_WEIGHT,
-    rrf_semantic_weight: float = 1.0,
-    rrf_bm25_weight: float = 1.0,
-    bm25_confirm_faiss_k: int = BM25_CONFIRM_FAISS_TOP_K,
-    bm25_confirm_rrf_k: int = BM25_CONFIRM_RRF_TOP_K,
-    bm25_confirm_reranker_score: float = BM25_CONFIRM_RERANKER_SCORE,
-    max_context_tokens: int = MAX_CONTEXT_TOKENS,
-    min_context_score: float = MIN_CONTEXT_SCORE,
-    min_context_relative_score: float = MIN_CONTEXT_RELATIVE_SCORE,
-    source_diversity_penalty: float = SOURCE_DIVERSITY_PENALTY,
-    tokenizer_model: str = "gpt-4o",
-    token_counter: Callable[[str], int] | None = None,
-) -> dict[str, str]:
+    rrf_semantic_weight: float = FAISS_WEIGHT,
+    rrf_bm25_weight: float = BM25_WEIGHT,
+) -> DiagnosticResult:
     """Run all requested stages for one question and prepare one CSV row."""
 
     faiss_hits: list[Document] = []
@@ -215,8 +186,6 @@ def collect_diagnostic_row(
             top_k=rrf_top_k,
             faiss_k=faiss_top_k,
             bm25_k=bm25_top_k,
-            faiss_protected_k=faiss_protected_top_k,
-            bm25_protected_k=bm25_protected_top_k,
             semantic_weight=rrf_semantic_weight,
             lexical_weight=rrf_bm25_weight,
         )
@@ -235,19 +204,6 @@ def collect_diagnostic_row(
                 top_k=final_context_top_k,
                 reranker_input_k=reranker_input_top_k,
                 reranker_output_k=reranker_top_k,
-                faiss_weight=faiss_weight,
-                bm25_weight=bm25_weight,
-                rrf_weight=rrf_weight,
-                reranker_weight=reranker_weight,
-                bm25_confirm_faiss_k=bm25_confirm_faiss_k,
-                bm25_confirm_rrf_k=bm25_confirm_rrf_k,
-                bm25_confirm_reranker_score=bm25_confirm_reranker_score,
-                max_context_tokens=max_context_tokens,
-                min_context_score=min_context_score,
-                min_context_relative_score=min_context_relative_score,
-                source_diversity_penalty=source_diversity_penalty,
-                tokenizer_model=tokenizer_model,
-                token_counter=token_counter,
             )
         except Exception as exc:
             errors.append(_short_error("Qwen Reranker", exc))
@@ -258,19 +214,6 @@ def collect_diagnostic_row(
                 top_k=final_context_top_k,
                 reranker_input_k=reranker_input_top_k,
                 reranker_output_k=reranker_top_k,
-                faiss_weight=faiss_weight,
-                bm25_weight=bm25_weight,
-                rrf_weight=rrf_weight,
-                reranker_weight=reranker_weight,
-                bm25_confirm_faiss_k=bm25_confirm_faiss_k,
-                bm25_confirm_rrf_k=bm25_confirm_rrf_k,
-                bm25_confirm_reranker_score=bm25_confirm_reranker_score,
-                max_context_tokens=max_context_tokens,
-                min_context_score=min_context_score,
-                min_context_relative_score=min_context_relative_score,
-                source_diversity_penalty=source_diversity_penalty,
-                tokenizer_model=tokenizer_model,
-                token_counter=token_counter,
             )
         reranker_input = ranking.reranker_input
         reranked_hits = ranking.reranked
@@ -285,7 +228,7 @@ def collect_diagnostic_row(
         reranker_top_k,
         final_context_top_k,
     )
-    return {
+    row = {
         "id": identifier,
         "question": question,
         columns[2]: _documents_json(faiss_hits),
@@ -297,6 +240,13 @@ def collect_diagnostic_row(
         "Final Context": final_context,
         "error": "\n".join(errors),
     }
+    return DiagnosticResult(row=row, final_hits=final_hits)
+
+
+def collect_diagnostic_row(*args: Any, **kwargs: Any) -> dict[str, str]:
+    """Backward-compatible row-only wrapper used by the standalone diagnostic."""
+
+    return collect_diagnostic_result(*args, **kwargs).row
 
 
 def _resolve_input_paths(
@@ -327,23 +277,8 @@ def write_diagnostics(
     reranker_input_top_k: int = RERANKER_INPUT_K,
     reranker_top_k: int = RERANKER_TOP_K,
     final_context_top_k: int = FINAL_CONTEXT_TOP_K,
-    faiss_protected_top_k: int = FAISS_PROTECTED_TOP_K,
-    bm25_protected_top_k: int = BM25_PROTECTED_TOP_K,
-    faiss_weight: float = FAISS_WEIGHT,
-    bm25_weight: float = BM25_WEIGHT,
-    rrf_weight: float = RRF_WEIGHT,
-    reranker_weight: float = RERANKER_WEIGHT,
-    rrf_semantic_weight: float = 1.0,
-    rrf_bm25_weight: float = 1.0,
-    bm25_confirm_faiss_k: int = BM25_CONFIRM_FAISS_TOP_K,
-    bm25_confirm_rrf_k: int = BM25_CONFIRM_RRF_TOP_K,
-    bm25_confirm_reranker_score: float = BM25_CONFIRM_RERANKER_SCORE,
-    max_context_tokens: int = MAX_CONTEXT_TOKENS,
-    min_context_score: float = MIN_CONTEXT_SCORE,
-    min_context_relative_score: float = MIN_CONTEXT_RELATIVE_SCORE,
-    source_diversity_penalty: float = SOURCE_DIVERSITY_PENALTY,
-    tokenizer_model: str = "gpt-4o",
-    token_counter: Callable[[str], int] | None = None,
+    rrf_semantic_weight: float = FAISS_WEIGHT,
+    rrf_bm25_weight: float = BM25_WEIGHT,
 ) -> Path:
     """Build the index, run diagnostics, and write ``diagnostic.csv``."""
 
@@ -401,23 +336,8 @@ def write_diagnostics(
                 reranker_input_top_k=reranker_input_top_k,
                 reranker_top_k=reranker_top_k,
                 final_context_top_k=final_context_top_k,
-                faiss_protected_top_k=faiss_protected_top_k,
-                bm25_protected_top_k=bm25_protected_top_k,
-                faiss_weight=faiss_weight,
-                bm25_weight=bm25_weight,
-                rrf_weight=rrf_weight,
-                reranker_weight=reranker_weight,
                 rrf_semantic_weight=rrf_semantic_weight,
                 rrf_bm25_weight=rrf_bm25_weight,
-                bm25_confirm_faiss_k=bm25_confirm_faiss_k,
-                bm25_confirm_rrf_k=bm25_confirm_rrf_k,
-                bm25_confirm_reranker_score=bm25_confirm_reranker_score,
-                max_context_tokens=max_context_tokens,
-                min_context_score=min_context_score,
-                min_context_relative_score=min_context_relative_score,
-                source_diversity_penalty=source_diversity_penalty,
-                tokenizer_model=tokenizer_model,
-                token_counter=token_counter,
             )
             if index_error:
                 row["error"] = "\n".join(filter(None, (index_error, row["error"])))
@@ -473,64 +393,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=_platform_int("FINAL_CONTEXT_TOP_K", FINAL_CONTEXT_TOP_K, 1, 100),
     )
     parser.add_argument(
-        "--faiss-protected-top-k", type=int,
-        default=_platform_int("FAISS_PROTECTED_TOP_K", FAISS_PROTECTED_TOP_K, 0, 75),
-    )
-    parser.add_argument(
-        "--bm25-protected-top-k", type=int,
-        default=_platform_int("BM25_PROTECTED_TOP_K", BM25_PROTECTED_TOP_K, 0, 75),
-    )
-    parser.add_argument(
-        "--faiss-weight", type=float,
-        default=_platform_float("FAISS_WEIGHT", FAISS_WEIGHT, 0.0, 1.0),
-    )
-    parser.add_argument(
-        "--bm25-weight", type=float,
-        default=_platform_float("BM25_WEIGHT", BM25_WEIGHT, 0.0, 1.0),
-    )
-    parser.add_argument(
-        "--rrf-weight", type=float,
-        default=_platform_float("RRF_WEIGHT", RRF_WEIGHT, 0.0, 1.0),
-    )
-    parser.add_argument(
-        "--reranker-weight", type=float,
-        default=_platform_float("RERANKER_WEIGHT", RERANKER_WEIGHT, 0.0, 1.0),
-    )
-    parser.add_argument(
         "--rrf-semantic-weight", type=float,
-        default=_platform_float("RRF_SEMANTIC_WEIGHT", 1.0, 0.0, 5.0),
+        default=_platform_float("RRF_SEMANTIC_WEIGHT", FAISS_WEIGHT, 0.0, 1.0),
     )
     parser.add_argument(
         "--rrf-bm25-weight", type=float,
-        default=_platform_float("RRF_BM25_WEIGHT", 1.0, 0.0, 5.0),
-    )
-    parser.add_argument(
-        "--bm25-confirm-faiss-k", type=_positive_int,
-        default=_platform_int("BM25_CONFIRM_FAISS_TOP_K", BM25_CONFIRM_FAISS_TOP_K, 1, 75),
-    )
-    parser.add_argument(
-        "--bm25-confirm-rrf-k", type=_positive_int,
-        default=_platform_int("BM25_CONFIRM_RRF_TOP_K", BM25_CONFIRM_RRF_TOP_K, 1, 100),
-    )
-    parser.add_argument(
-        "--bm25-confirm-reranker-score", type=float,
-        default=_platform_float("BM25_CONFIRM_RERANKER_SCORE", BM25_CONFIRM_RERANKER_SCORE, -20.0, 20.0),
-    )
-    parser.add_argument(
-        "--max-context-tokens", type=_positive_int,
-        default=_platform_int("MAX_CONTEXT_TOKENS", MAX_CONTEXT_TOKENS, 256, 200_000),
-    )
-    parser.add_argument(
-        "--min-context-score", type=float,
-        default=_platform_float("MIN_CONTEXT_SCORE", MIN_CONTEXT_SCORE, 0.0, 1.0),
-    )
-    parser.add_argument(
-        "--min-context-relative-score", type=float,
-        default=_platform_float("MIN_CONTEXT_RELATIVE_SCORE", MIN_CONTEXT_RELATIVE_SCORE, 0.0, 1.0),
-    )
-    parser.add_argument(
-        "--source-diversity-penalty", type=float,
-        default=_platform_float("SOURCE_DIVERSITY_PENALTY", SOURCE_DIVERSITY_PENALTY, 0.0, 1.0),
+        default=_platform_float("RRF_BM25_WEIGHT", BM25_WEIGHT, 0.0, 1.0),
     )
     return parser
 
@@ -552,22 +420,8 @@ def main(argv: Sequence[str] | None = None) -> Path:
         reranker_input_top_k=args.reranker_input_top_k,
         reranker_top_k=args.reranker_top_k,
         final_context_top_k=args.final_context_top_k,
-        faiss_protected_top_k=args.faiss_protected_top_k,
-        bm25_protected_top_k=args.bm25_protected_top_k,
-        faiss_weight=args.faiss_weight,
-        bm25_weight=args.bm25_weight,
-        rrf_weight=args.rrf_weight,
-        reranker_weight=args.reranker_weight,
         rrf_semantic_weight=args.rrf_semantic_weight,
         rrf_bm25_weight=args.rrf_bm25_weight,
-        bm25_confirm_faiss_k=args.bm25_confirm_faiss_k,
-        bm25_confirm_rrf_k=args.bm25_confirm_rrf_k,
-        bm25_confirm_reranker_score=args.bm25_confirm_reranker_score,
-        max_context_tokens=args.max_context_tokens,
-        min_context_score=args.min_context_score,
-        min_context_relative_score=args.min_context_relative_score,
-        source_diversity_penalty=args.source_diversity_penalty,
-        tokenizer_model=os.getenv("LLM_MODEL", "gpt-4o"),
     )
 
 

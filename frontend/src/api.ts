@@ -90,7 +90,7 @@ export async function askQuestion(
   return request<QueryResponse>("/query", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question, history, top_k: 5, use_reranker: true }),
+    body: JSON.stringify({ question, history, use_reranker: true }),
   });
 }
 

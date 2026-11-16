@@ -15,6 +15,7 @@ __pycache__/
 node_modules/
 dist/
 .vite/
+*.tsbuildinfo
 
 # Local data and model caches
 data/documents/*

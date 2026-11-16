@@ -10,7 +10,7 @@ from pathlib import Path
 from app.core.config import ROOT_DIR, settings
 from app.models.schemas import QueryRequest, QueryResponse, SourceDocument
 from app.services.artifacts import Corpus, load_corpus
-from app.services.rag import Document
+from app.services.rag import Document, RerankerError
 from app.services.rag.embedding import EmbeddingAPIError, EmbeddingClient
 from app.services.rag.llm import LLMAPIError, OpenAICompatibleLLM
 from app.services.rag.pipeline import RAGSystem
@@ -42,6 +42,8 @@ class RAGPipeline:
                 base_url=settings.llm_base_url,
                 api_key=api_key,
                 model=settings.llm_model,
+                temperature=settings.temperature,
+                max_tokens=settings.max_tokens,
                 timeout=45,
                 retries=1,
             )
@@ -68,8 +70,13 @@ class RAGPipeline:
             ),
             reranker=reranker,
             llm=llm,
+            retrieve_k=settings.top_k,
+            rrf_top_k=settings.rrf_top_k,
+            top_k=settings.final_context_top_k,
             rerank_candidates=settings.reranker_candidates,
-            reranker_output_k=settings.reranker_candidates,
+            reranker_output_k=settings.reranker_top_n,
+            semantic_weight=settings.rrf_semantic_weight,
+            lexical_weight=settings.rrf_bm25_weight,
         )
         self.rag.index = self.corpus.index
         self.rag.chunks = self.corpus.chunks
@@ -83,22 +90,23 @@ class RAGPipeline:
         )
         search_question = f"{previous}\n{question}" if previous and len(question) < 80 else question
         mode = "bm25" if self._embedding_unavailable else "hybrid"
-        try:
-            sources = self.rag.retrieve(
-                search_question,
-                search_mode=mode,
-                top_k=request.top_k,
-                use_reranker=request.use_reranker and settings.reranker_enabled,
-            )
-        except EmbeddingAPIError:
-            self._embedding_unavailable = True
-            mode = "bm25"
-            sources = self.rag.retrieve(
-                search_question,
-                search_mode=mode,
-                top_k=request.top_k,
-                use_reranker=request.use_reranker and settings.reranker_enabled,
-            )
+        use_reranker = request.use_reranker and settings.reranker_enabled
+        for _ in range(3):
+            try:
+                sources = self.rag.retrieve(
+                    search_question,
+                    search_mode=mode,
+                    top_k=min(request.top_k or settings.final_context_top_k, settings.final_context_top_k),
+                    use_reranker=use_reranker,
+                )
+                break
+            except EmbeddingAPIError:
+                self._embedding_unavailable = True
+                mode = "bm25"
+            except RerankerError:
+                use_reranker = False
+        else:
+            raise RuntimeError("RAG retrieval failed after model fallbacks")
         llm_status = "configured" if not isinstance(self.rag.llm, ExtractiveLLM) else "extractive"
         if not sources:
             answer = ExtractiveLLM().generate(question, [])
@@ -128,6 +136,7 @@ class RAGPipeline:
                 "search_mode": mode,
                 "indexed_chunks": len(self.corpus.chunks),
                 "llm": llm_status,
+                "reranked": use_reranker,
             },
         )
 

@@ -1,8 +1,10 @@
 from fastapi.testclient import TestClient
+from unittest.mock import patch
 
 from app.api.routes.query import get_pipeline
 from app.main import app
 from app.services.pipeline import ExtractiveLLM, RAGPipeline, get_corpus
+from app.services.rag.embedding import EmbeddingAPIError
 
 
 client = TestClient(app)
@@ -31,10 +33,11 @@ def test_query_returns_real_indexed_sources() -> None:
     pipeline.rag.llm = ExtractiveLLM()
     app.dependency_overrides[get_pipeline] = lambda: pipeline
     try:
-        response = client.post(
-            "/api/v1/query",
-            json={"question": "Арендная плата по договору А-08/2024", "top_k": 3},
-        )
+        with patch.object(pipeline.rag.embedding_client, "embed", side_effect=EmbeddingAPIError("offline")):
+            response = client.post(
+                "/api/v1/query",
+                json={"question": "Арендная плата по договору А-08/2024", "top_k": 3, "use_reranker": False},
+            )
     finally:
         app.dependency_overrides.pop(get_pipeline, None)
     assert response.status_code == 200, response.text

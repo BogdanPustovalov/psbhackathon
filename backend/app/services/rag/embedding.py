@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import math
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from threading import RLock
@@ -166,6 +167,11 @@ class EmbeddingClient:
                         cache_dir=self.cache_folder,
                         local_files_only=True,
                     )
+                print(
+                    f"Loading embedding model on {self.device or 'auto'}...",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 self._model = SentenceTransformer(
                     model_source,
                     device=self.device,
@@ -194,7 +200,7 @@ class EmbeddingClient:
                     batch_size=self.batch_size,
                     normalize_embeddings=True,
                     convert_to_numpy=True,
-                    show_progress_bar=False,
+                    show_progress_bar=len(texts) > self.batch_size,
                 )
             if vectors.ndim != 2 or vectors.shape != (len(texts), BGE_M3_DIMENSION):
                 raise EmbeddingAPIError("BGE-M3 вернула матрицу неправильного размера")

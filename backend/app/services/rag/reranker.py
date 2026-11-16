@@ -77,7 +77,7 @@ class Reranker:
                     "CUDA was requested but is unavailable in this PyTorch install "
                     f"(torch={torch.__version__}, CUDA build={torch.version.cuda}). "
                     "Install the GPU build with: "
-                    "python -m pip install -r backend/app/services/rag/requirements-gpu.txt"
+                    "python -m pip install -r the matching PyTorch CUDA wheel"
                 )
 
             kwargs: dict[str, Any] = {

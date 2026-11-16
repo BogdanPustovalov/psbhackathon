@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass, field
+import hashlib
 import io
 import math
 import os
 import re
 import sys
-from collections.abc import Callable, Iterable
+import uuid
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -15,39 +17,21 @@ import zipfile
 from xml.etree import ElementTree as ET
 
 from . import (
-    BM25_PROTECTED_TOP_K,
-    BM25_CONFIRM_FAISS_TOP_K,
-    BM25_CONFIRM_RERANKER_SCORE,
-    BM25_CONFIRM_RRF_TOP_K,
     BM25_WEIGHT,
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_CHUNK_SIZE,
-    FAISS_PROTECTED_TOP_K,
     FAISS_TOP_K,
     FAISS_WEIGHT,
     FINAL_CONTEXT_TOP_K,
-    MAX_CONTEXT_TOKENS,
-    MIN_CONTEXT_RELATIVE_SCORE,
-    MIN_CONTEXT_SCORE,
     RERANKER_INPUT_K,
     RERANKER_TOP_K,
-    RERANKER_WEIGHT,
     RRF_TOP_K,
-    RRF_WEIGHT,
-    SOURCE_DIVERSITY_PENALTY,
     SUPPORTED_EXTENSIONS,
     Document,
 )
 from .embedding import EmbeddingClient
 from .llm import OpenAICompatibleLLM
-from .relevance import (
-    count_model_tokens,
-    document_temporal_metadata,
-    exact_legal_reference_match,
-    question_reference_date,
-    suspected_prompt_injection,
-    temporal_status,
-)
+from .relevance import document_temporal_metadata
 from .reranker import Reranker
 from .vector_store import FaissVectorIndex, HybridSearchTrace, embed_and_index
 
@@ -426,7 +410,7 @@ def load_and_index(
 
 @dataclass(slots=True)
 class HybridRanking:
-    """The Qwen input/output and the final protected context selection."""
+    """The weighted RRF pool, reranker scores and final context."""
 
     reranker_input: list[Document]
     reranked: list[Document]
@@ -441,259 +425,51 @@ def rank_hybrid_candidates(
     top_k: int = FINAL_CONTEXT_TOP_K,
     reranker_input_k: int = RERANKER_INPUT_K,
     reranker_output_k: int = RERANKER_TOP_K,
-    faiss_weight: float = FAISS_WEIGHT,
-    bm25_weight: float = BM25_WEIGHT,
-    rrf_weight: float = RRF_WEIGHT,
-    reranker_weight: float = RERANKER_WEIGHT,
-    bm25_confirm_faiss_k: int = BM25_CONFIRM_FAISS_TOP_K,
-    bm25_confirm_rrf_k: int = BM25_CONFIRM_RRF_TOP_K,
-    bm25_confirm_reranker_score: float = BM25_CONFIRM_RERANKER_SCORE,
-    max_context_tokens: int = MAX_CONTEXT_TOKENS,
-    min_context_score: float = MIN_CONTEXT_SCORE,
-    min_context_relative_score: float = MIN_CONTEXT_RELATIVE_SCORE,
-    source_diversity_penalty: float = SOURCE_DIVERSITY_PENALTY,
-    tokenizer_model: str = "gpt-4o",
-    token_counter: Callable[[str], int] | None = None,
 ) -> HybridRanking:
-    """Confirm BM25 protection and select a bounded, variable-size context."""
+    """Rerank the weighted RRF pool and pass its Top-N directly to the LLM."""
 
     if min(top_k, reranker_input_k, reranker_output_k) <= 0:
         raise ValueError("Context and reranker limits must be positive")
-    weights = (faiss_weight, bm25_weight, rrf_weight, reranker_weight)
-    if not all(math.isfinite(weight) and weight >= 0 for weight in weights) or not any(weights):
-        raise ValueError("Final ranking weights must be finite and nonnegative")
-    if min(bm25_confirm_faiss_k, bm25_confirm_rrf_k, max_context_tokens) <= 0:
-        raise ValueError("Confirmation ranks and context token budget must be positive")
-    if not math.isfinite(bm25_confirm_reranker_score):
-        raise ValueError("BM25 reranker threshold must be finite")
-    if (
-        not math.isfinite(min_context_score) or min_context_score < 0
-        or not 0 <= min_context_relative_score <= 1
-        or not math.isfinite(source_diversity_penalty) or source_diversity_penalty < 0
-    ):
-        raise ValueError("Invalid adaptive context parameters")
 
-    candidates = trace.candidates
-    if not candidates:
+    reranker_input = trace.candidates[:reranker_input_k]
+    if not reranker_input:
         return HybridRanking([], [], [])
-    pool_protected = {
-        str(document.metadata["chunk_id"])
-        for document in candidates if document.metadata.get("protected_by")
-    }
-    if len(pool_protected) > reranker_input_k:
-        raise ValueError("Reranker pool is too small for protected source candidates")
-
-    selected_input = set(pool_protected)
-    for document in candidates:
-        if len(selected_input) >= reranker_input_k:
-            break
-        selected_input.add(str(document.metadata["chunk_id"]))
-    reranker_input = [
-        document for document in candidates
-        if str(document.metadata["chunk_id"]) in selected_input
-    ]
-    if reranker is not None and reranker_output_k < len(reranker_input):
-        raise ValueError("Reranker must score every input candidate")
-
-    ranked_by_qwen: list[Document] = []
-    raw_scores: dict[str, float] = {}
-    reranker_ranks: dict[str, int] = {}
-    if reranker is not None and reranker_input:
-        rerank_copies = [
-            Document(text=doc.text, metadata=dict(doc.metadata))
-            for doc in reranker_input
+    if reranker is None:
+        final = [
+            Document(
+                doc.text,
+                {**doc.metadata, "selection_reason": "rrf_fallback"},
+                doc.score,
+            )
+            for doc in reranker_input[:top_k]
         ]
-        output = reranker.rerank(query, rerank_copies, top_k=reranker_output_k)
-        if len(output) != len(reranker_input) or any(
-            not isinstance(doc, Document) for doc in output
-        ):
-            raise ValueError("Reranker did not return all input candidates")
-        expected = {str(doc.metadata["chunk_id"]) for doc in reranker_input}
-        for position, doc in enumerate(output, start=1):
-            chunk_id = str(doc.metadata.get("chunk_id"))
-            if chunk_id not in expected or chunk_id in reranker_ranks:
-                raise ValueError("Reranker returned an unknown or duplicate chunk")
-            if doc.score is None or not math.isfinite(float(doc.score)):
-                raise ValueError("Reranker returned a non-finite or missing score")
-            raw_scores[chunk_id] = float(doc.score)
-            reranker_ranks[chunk_id] = position
-            ranked_by_qwen.append(doc)
+        return HybridRanking(reranker_input, [], final)
+    if reranker_output_k < len(reranker_input):
+        raise ValueError("Reranker must score every RRF candidate")
 
-    # Qwen returns unbounded logits, so normalize only within this question.
-    # A constant set of scores carries no ordering information (neutral 0.5).
-    score_min = min(raw_scores.values()) if raw_scores else 0.0
-    score_max = max(raw_scores.values()) if raw_scores else 0.0
-    normalized_qwen = {
-        chunk_id: (score - score_min) / (score_max - score_min)
-        if score_max > score_min else 0.5
-        for chunk_id, score in raw_scores.items()
-    }
-
-    scored: list[Document] = []
-    by_id: dict[str, Document] = {}
-    as_of = question_reference_date(query)
-    for document in candidates:
-        metadata = dict(document.metadata)
-        chunk_id = str(metadata["chunk_id"])
-        faiss_rank = metadata.get("faiss_rank")
-        bm25_rank = metadata.get("bm25_rank")
-        # Rank 1 has reciprocal score 1/2; dividing by that maximum yields
-        # independent FAISS/BM25 signals in [0, 1] before 40/40 weighting.
-        faiss_signal = 2 / (1 + faiss_rank) if faiss_rank is not None else 0.0
-        bm25_signal = 2 / (1 + bm25_rank) if bm25_rank is not None else 0.0
-        base_score = (faiss_signal + bm25_signal) / 2
-        combined_score = (
-            faiss_weight * faiss_signal
-            + bm25_weight * bm25_signal
-            + rrf_weight * float(metadata["rrf_normalized"])
-            + reranker_weight * normalized_qwen.get(chunk_id, 0.0)
-        )
-        status = temporal_status(as_of, metadata)
-        temporal_adjustment = (
-            0.08 if status == "active" else
-            -0.25 if status in {"future", "expired"} else 0.0
-        )
-        final_score = combined_score + temporal_adjustment
-        exact_match = exact_legal_reference_match(query, document.text, metadata)
-        injection_suspected = suspected_prompt_injection(document.text)
-        bm25_confirmation: list[str] = []
-        if "bm25" in metadata.get("protected_by", []):
-            if faiss_rank is not None and faiss_rank <= bm25_confirm_faiss_k:
-                bm25_confirmation.append("faiss_top")
-            if metadata["rrf_rank"] <= bm25_confirm_rrf_k:
-                bm25_confirmation.append("rrf_top")
-            if raw_scores.get(chunk_id, float("-inf")) >= bm25_confirm_reranker_score:
-                bm25_confirmation.append("reranker_score")
-            if exact_match:
-                bm25_confirmation.append("exact_legal_reference")
-        metadata.update(
-            faiss_normalized=faiss_signal,
-            bm25_normalized=bm25_signal,
-            base_score=base_score,
-            reranker_rank=reranker_ranks.get(chunk_id),
-            reranker_score=raw_scores.get(chunk_id),
-            reranker_normalized=normalized_qwen.get(chunk_id),
-            combined_score=combined_score,
-            bm25_confirmation=bm25_confirmation,
-            exact_legal_reference_match=exact_match,
-            prompt_injection_suspected=injection_suspected,
-            question_as_of=as_of.isoformat() if as_of else None,
-            temporal_status=status,
-            temporal_adjustment=temporal_adjustment,
-            selected_by_protection=False,
-            selection_reason=None,
-            final_score=final_score,
-        )
-        scored_doc = Document(text=document.text, metadata=metadata, score=final_score)
-        scored.append(scored_doc)
-        by_id[chunk_id] = scored_doc
-
-    scored.sort(
-        key=lambda doc: (
-            -float(doc.score),
-            doc.metadata["rrf_rank"],
-            str(doc.metadata["chunk_id"]),
-        )
-    )
-
-    def source_key(document: Document) -> str:
-        metadata = document.metadata
-        return str(
-            metadata.get("document_id") or metadata.get("filename")
-            or metadata.get("source") or metadata["chunk_id"]
-        )
-
-    eligible: list[Document] = []
-    faiss_protected: list[Document] = []
-    bm25_confirmed: list[Document] = []
-    seen_passages: set[tuple[str, str]] = set()
-    for document in scored:
-        metadata = document.metadata
-        if metadata["prompt_injection_suspected"]:
-            metadata["selection_reason"] = "prompt_injection_suspected"
-            continue
-        if "bm25" in metadata.get("protected_by", []) and not metadata["bm25_confirmation"]:
-            metadata["selection_reason"] = "bm25_unconfirmed"
-            continue
-        passage = (source_key(document), re.sub(r"\s+", " ", document.text).strip().casefold())
-        if passage in seen_passages:
-            metadata["selection_reason"] = "duplicate_fragment"
-            continue
-        seen_passages.add(passage)
-        eligible.append(document)
-        if "faiss" in metadata.get("protected_by", []) and metadata["temporal_status"] not in {"future", "expired"}:
-            faiss_protected.append(document)
-        elif "bm25" in metadata.get("protected_by", []) and metadata["bm25_confirmation"] and metadata["temporal_status"] not in {"future", "expired"}:
-            bm25_confirmed.append(document)
-
-    if len(faiss_protected) + len(bm25_confirmed) > top_k:
-        raise ValueError("Final context is too small for confirmed protected hits")
-    best_score = max((float(doc.score) for doc in eligible), default=0.0)
-    score_floor = max(min_context_score, min_context_relative_score * best_score)
-    count_tokens = token_counter or (
-        lambda text: count_model_tokens(text, tokenizer_model)
-    )
-    selected: list[Document] = []
-    selected_ids: set[str] = set()
-    source_counts: dict[str, int] = {}
-
-    def add_to_context(document: Document, reason: str, protected: bool) -> bool:
-        trial = sorted(
-            selected + [document],
-            key=lambda doc: (-float(doc.score), doc.metadata["rrf_rank"]),
-        )
-        if count_tokens(OpenAICompatibleLLM._source_context(trial)) > max_context_tokens:
-            document.metadata["selection_reason"] = "token_budget_exceeded"
-            return False
-        selected.append(document)
-        selected_ids.add(str(document.metadata["chunk_id"]))
-        source = source_key(document)
-        source_counts[source] = source_counts.get(source, 0) + 1
-        document.metadata["selection_reason"] = reason
-        document.metadata["selected_by_protection"] = protected
-        return True
-
-    for document in sorted(faiss_protected, key=lambda doc: doc.metadata["faiss_rank"]):
-        if len(selected) >= top_k:
-            break
-        add_to_context(document, "faiss_protected", True)
-    for document in sorted(bm25_confirmed, key=lambda doc: doc.metadata["bm25_rank"]):
-        if len(selected) >= top_k:
-            break
-        add_to_context(document, "bm25_confirmed", True)
-
-    protected_ids = {
-        str(doc.metadata["chunk_id"]) for doc in faiss_protected + bm25_confirmed
-    }
-    remaining = [
-        doc for doc in eligible
-        if str(doc.metadata["chunk_id"]) not in selected_ids
-        and str(doc.metadata["chunk_id"]) not in protected_ids
+    copies = [
+        Document(doc.text, dict(doc.metadata))
+        for doc in reranker_input
     ]
-    while len(selected) < top_k and remaining:
-        document = max(
-            remaining,
-            key=lambda doc: (
-                float(doc.score) - source_diversity_penalty * source_counts.get(source_key(doc), 0),
-                -doc.metadata["rrf_rank"],
-            ),
-        )
-        remaining.remove(document)
-        if float(document.score) < score_floor:
-            document.metadata["selection_reason"] = "below_relevance_threshold"
-            continue
-        reason = "temporal_relevance" if document.metadata["temporal_status"] == "active" else "combined_score"
-        add_to_context(document, reason, False)
-
-    final = sorted(selected, key=lambda doc: (-float(doc.score), doc.metadata["rrf_rank"]))
-
-    reranked = []
-    for document in ranked_by_qwen:
-        chunk_id = str(document.metadata["chunk_id"])
-        metadata = dict(by_id[chunk_id].metadata)
-        reranked.append(Document(document.text, metadata, raw_scores[chunk_id]))
-    return HybridRanking(reranker_input, reranked, final)
-
+    reranked = reranker.rerank(query, copies, top_k=reranker_output_k)
+    expected = {str(doc.metadata["chunk_id"]) for doc in reranker_input}
+    seen: set[str] = set()
+    if len(expected) != len(reranker_input) or len(reranked) != len(reranker_input):
+        raise ValueError("Reranker did not return all unique RRF candidates")
+    for rank, doc in enumerate(reranked, start=1):
+        if not isinstance(doc, Document):
+            raise ValueError("Reranker returned an invalid document")
+        chunk_id = str(doc.metadata.get("chunk_id"))
+        if chunk_id not in expected or chunk_id in seen:
+            raise ValueError("Reranker returned an unknown or duplicate chunk")
+        if doc.score is None or not math.isfinite(float(doc.score)):
+            raise ValueError("Reranker returned a non-finite or missing score")
+        seen.add(chunk_id)
+        doc.metadata["reranker_rank"] = rank
+        doc.metadata["reranker_score"] = float(doc.score)
+        if rank <= top_k:
+            doc.metadata["selection_reason"] = "reranker_top_n"
+    return HybridRanking(reranker_input, reranked, reranked[:top_k])
 
 def search_and_rerank(
     query: str,
@@ -796,22 +572,8 @@ class RAGSystem:
         rerank_candidates: int | None = RERANKER_INPUT_K,
         reranker_output_k: int = RERANKER_TOP_K,
         rrf_top_k: int = RRF_TOP_K,
-        faiss_protected_k: int = FAISS_PROTECTED_TOP_K,
-        bm25_protected_k: int = BM25_PROTECTED_TOP_K,
-        faiss_weight: float = FAISS_WEIGHT,
-        bm25_weight: float = BM25_WEIGHT,
-        rrf_weight: float = RRF_WEIGHT,
-        reranker_weight: float = RERANKER_WEIGHT,
-        bm25_confirm_faiss_k: int = BM25_CONFIRM_FAISS_TOP_K,
-        bm25_confirm_rrf_k: int = BM25_CONFIRM_RRF_TOP_K,
-        bm25_confirm_reranker_score: float = BM25_CONFIRM_RERANKER_SCORE,
-        max_context_tokens: int = MAX_CONTEXT_TOKENS,
-        min_context_score: float = MIN_CONTEXT_SCORE,
-        min_context_relative_score: float = MIN_CONTEXT_RELATIVE_SCORE,
-        source_diversity_penalty: float = SOURCE_DIVERSITY_PENALTY,
-        token_counter: Callable[[str], int] | None = None,
-        semantic_weight: float = 1.0,
-        lexical_weight: float = 1.0,
+        semantic_weight: float = FAISS_WEIGHT,
+        lexical_weight: float = BM25_WEIGHT,
     ) -> None:
         if search_mode not in {"hybrid", "semantic", "bm25"}:
             raise ValueError("search_mode должно быть 'hybrid', 'semantic', или 'bm25'")
@@ -825,11 +587,6 @@ class RAGSystem:
             raise ValueError("Reranker output must cover all reranker candidates")
         if rrf_top_k <= 0:
             raise ValueError("rrf_top_k должно быть больше нуля")
-        if min(faiss_protected_k, bm25_protected_k) < 0:
-            raise ValueError("Protected Top-K cannot be negative")
-        final_weights = (faiss_weight, bm25_weight, rrf_weight, reranker_weight)
-        if not all(math.isfinite(weight) and weight >= 0 for weight in final_weights) or not any(final_weights):
-            raise ValueError("Final ranking weights must be finite and nonnegative")
         if (
             not all(map(math.isfinite, (semantic_weight, lexical_weight)))
             or min(semantic_weight, lexical_weight) < 0
@@ -849,20 +606,6 @@ class RAGSystem:
         self.rerank_candidates = rerank_candidates
         self.reranker_output_k = reranker_output_k
         self.rrf_top_k = rrf_top_k
-        self.faiss_protected_k = faiss_protected_k
-        self.bm25_protected_k = bm25_protected_k
-        self.faiss_weight = faiss_weight
-        self.bm25_weight = bm25_weight
-        self.rrf_weight = rrf_weight
-        self.reranker_weight = reranker_weight
-        self.bm25_confirm_faiss_k = bm25_confirm_faiss_k
-        self.bm25_confirm_rrf_k = bm25_confirm_rrf_k
-        self.bm25_confirm_reranker_score = bm25_confirm_reranker_score
-        self.max_context_tokens = max_context_tokens
-        self.min_context_score = min_context_score
-        self.min_context_relative_score = min_context_relative_score
-        self.source_diversity_penalty = source_diversity_penalty
-        self.token_counter = token_counter
         self.semantic_weight = semantic_weight
         self.lexical_weight = lexical_weight
         self.index = FaissVectorIndex(metric=metric)
@@ -889,7 +632,52 @@ class RAGSystem:
         if not chunks:
             return 0
 
-        embeddings = self.embedding_client.embed([chunk.text for chunk in chunks])
+        import numpy as np
+
+        digest = hashlib.sha256()
+        digest.update(str(getattr(self.embedding_client, "model_name", "unknown")).encode("utf-8"))
+        for chunk in chunks:
+            encoded = chunk.text.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        cache_dir = Path(
+            os.getenv("RAG_EMBEDDING_CACHE_DIR", str(Path(__file__).with_name(".cache")))
+        ).expanduser()
+        cache_path = cache_dir / f"embeddings-v1-{digest.hexdigest()}.npy"
+        embeddings = None
+        if cache_path.is_file():
+            try:
+                cached = np.load(cache_path, allow_pickle=False)
+                if (
+                    cached.ndim == 2
+                    and cached.shape[0] == len(chunks)
+                    and cached.shape[1] > 0
+                    and np.isfinite(cached).all()
+                ):
+                    embeddings = cached
+                    print(f"Loaded {len(chunks)} cached embeddings", file=sys.stderr, flush=True)
+            except (OSError, ValueError, TypeError) as exc:
+                print(f"Embedding cache is unavailable: {exc}", file=sys.stderr)
+        if embeddings is None:
+            print(f"Embedding {len(chunks)} chunks...", file=sys.stderr, flush=True)
+            embeddings = np.asarray(
+                self.embedding_client.embed([chunk.text for chunk in chunks]),
+                dtype=np.float32,
+            )
+            temporary: Path | None = None
+            try:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                temporary = cache_dir / f"{cache_path.stem}-{uuid.uuid4().hex}.npy"
+                with temporary.open("xb") as handle:
+                    np.save(handle, embeddings, allow_pickle=False)
+                temporary.replace(cache_path)
+            except OSError as exc:
+                print(f"Could not save embedding cache: {exc}", file=sys.stderr)
+                if temporary is not None:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         self.index.add(chunks, embeddings)
         self.chunks.extend(chunks)
         return len(chunks)
@@ -943,8 +731,6 @@ class RAGSystem:
                 top_k=fusion_count,
                 faiss_k=candidate_count,
                 bm25_k=candidate_count,
-                faiss_protected_k=self.faiss_protected_k,
-                bm25_protected_k=self.bm25_protected_k,
                 semantic_weight=self.semantic_weight,
                 lexical_weight=self.lexical_weight,
             )
@@ -955,19 +741,6 @@ class RAGSystem:
                 top_k=result_count,
                 reranker_input_k=self.rerank_candidates or fusion_count,
                 reranker_output_k=self.reranker_output_k,
-                faiss_weight=self.faiss_weight,
-                bm25_weight=self.bm25_weight,
-                rrf_weight=self.rrf_weight,
-                reranker_weight=self.reranker_weight,
-                bm25_confirm_faiss_k=self.bm25_confirm_faiss_k,
-                bm25_confirm_rrf_k=self.bm25_confirm_rrf_k,
-                bm25_confirm_reranker_score=self.bm25_confirm_reranker_score,
-                max_context_tokens=self.max_context_tokens,
-                min_context_score=self.min_context_score,
-                min_context_relative_score=self.min_context_relative_score,
-                source_diversity_penalty=self.source_diversity_penalty,
-                tokenizer_model=getattr(self.llm, "model", "gpt-4o"),
-                token_counter=self.token_counter,
             )
             if use_reranker and self.reranker is not None:
                 print(
@@ -1132,13 +905,27 @@ def run_platform_submission() -> Path:
     """..."""
 
     data_dir = Path(_platform_env("DATA_DIR", "data"))
-    questions_path = _find_platform_file(data_dir, "questions.csv")
-    knowledge_base_path = _find_platform_file(
-        data_dir,
-        "kb.zip",
-        "knowledge-base.zip",
-        "knowledge_base.zip",
+    questions_override = _platform_env("QUESTIONS_PATH")
+    questions_path = (
+        Path(questions_override).expanduser().resolve()
+        if questions_override
+        else _find_platform_file(data_dir, "questions.csv")
     )
+    knowledge_base_override = _platform_env("KNOWLEDGE_BASE_PATH")
+    knowledge_base_path = (
+        Path(knowledge_base_override).expanduser().resolve()
+        if knowledge_base_override
+        else _find_platform_file(
+            data_dir,
+            "kb.zip",
+            "knowledge-base.zip",
+            "knowledge_base.zip",
+        )
+    )
+    if not questions_path.is_file():
+        raise FileNotFoundError(f"Файл вопросов не найден: {questions_path}")
+    if not knowledge_base_path.is_file():
+        raise FileNotFoundError(f"База знаний не найдена: {knowledge_base_path}")
     questions = _load_platform_questions(questions_path)
     documents = load_documents(knowledge_base_path)
 
@@ -1178,21 +965,8 @@ def run_platform_submission() -> Path:
         rerank_candidates=reranker_candidates,
         reranker_output_k=reranker_top_n,
         rrf_top_k=rrf_top_k,
-        faiss_protected_k=_platform_int("FAISS_PROTECTED_TOP_K", FAISS_PROTECTED_TOP_K, 0, retrieve_k),
-        bm25_protected_k=_platform_int("BM25_PROTECTED_TOP_K", BM25_PROTECTED_TOP_K, 0, retrieve_k),
-        faiss_weight=_platform_float("FAISS_WEIGHT", FAISS_WEIGHT, 0.0, 1.0),
-        bm25_weight=_platform_float("BM25_WEIGHT", BM25_WEIGHT, 0.0, 1.0),
-        rrf_weight=_platform_float("RRF_WEIGHT", RRF_WEIGHT, 0.0, 1.0),
-        reranker_weight=_platform_float("RERANKER_WEIGHT", RERANKER_WEIGHT, 0.0, 1.0),
-        bm25_confirm_faiss_k=_platform_int("BM25_CONFIRM_FAISS_TOP_K", BM25_CONFIRM_FAISS_TOP_K, 1, retrieve_k),
-        bm25_confirm_rrf_k=_platform_int("BM25_CONFIRM_RRF_TOP_K", BM25_CONFIRM_RRF_TOP_K, 1, rrf_top_k),
-        bm25_confirm_reranker_score=_platform_float("BM25_CONFIRM_RERANKER_SCORE", BM25_CONFIRM_RERANKER_SCORE, -20.0, 20.0),
-        max_context_tokens=_platform_int("MAX_CONTEXT_TOKENS", MAX_CONTEXT_TOKENS, 256, 200_000),
-        min_context_score=_platform_float("MIN_CONTEXT_SCORE", MIN_CONTEXT_SCORE, 0.0, 1.0),
-        min_context_relative_score=_platform_float("MIN_CONTEXT_RELATIVE_SCORE", MIN_CONTEXT_RELATIVE_SCORE, 0.0, 1.0),
-        source_diversity_penalty=_platform_float("SOURCE_DIVERSITY_PENALTY", SOURCE_DIVERSITY_PENALTY, 0.0, 1.0),
-        semantic_weight=_platform_float("RRF_SEMANTIC_WEIGHT", 1.0, 0.0, 5.0),
-        lexical_weight=_platform_float("RRF_BM25_WEIGHT", 1.0, 0.0, 5.0),
+        semantic_weight=_platform_float("RRF_SEMANTIC_WEIGHT", FAISS_WEIGHT, 0.0, 1.0),
+        lexical_weight=_platform_float("RRF_BM25_WEIGHT", BM25_WEIGHT, 0.0, 1.0),
     )
 
     try:
@@ -1205,26 +979,100 @@ def run_platform_submission() -> Path:
         indexed = rag.ingest_lexical(documents)
         print(f"Индексировано {indexed} фрагментов с BM25", file=sys.stderr)
 
-    def answer_one(position: int, item: tuple[str, str]) -> tuple[int, str]:
+    # Keep the diagnostic pass and answer generation on the same retrieval
+    # result. This avoids embedding/reranking every question twice.
+    from .diagnostic import (
+        _column_names as _diagnostic_column_names,
+        _documents_json,
+        collect_diagnostic_result,
+    )
+
+    diagramm_faiss_top_k = retrieve_k
+    diagramm_bm25_top_k = retrieve_k
+    diagramm_rrf_top_k = rrf_top_k
+    diagramm_reranker_input_k = reranker_candidates
+    diagramm_reranker_top_k = reranker_top_n
+    diagramm_final_context_top_k = final_context_top_k
+    diagramm_columns = list(
+        _diagnostic_column_names(
+            diagramm_faiss_top_k,
+            diagramm_bm25_top_k,
+            diagramm_rrf_top_k,
+            diagramm_reranker_input_k,
+            diagramm_reranker_top_k,
+            diagramm_final_context_top_k,
+        )
+    )
+
+    output_path = Path(_platform_env("OUTPUT_PATH", "submission.csv")).expanduser().resolve()
+    diagramm_override = _platform_env("DIAGRAMM_OUTPUT")
+    diagramm_path = (
+        Path(diagramm_override).expanduser().resolve()
+        if diagramm_override
+        else output_path.with_name("diagramm.csv")
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    diagramm_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def empty_diagramm_row(identifier: str, question: str, error: str) -> dict[str, str]:
+        row = {
+            "id": identifier,
+            "question": question,
+            "Final Context": "",
+            "error": error,
+        }
+        row.update({column: "[]" for column in diagramm_columns[2:7]})
+        return row
+
+    def record_actual_context(
+        row: dict[str, str], sources: list[Document], error: str
+    ) -> dict[str, str]:
+        row[diagramm_columns[7]] = _documents_json(sources)
+        row["Final Context"] = OpenAICompatibleLLM._source_context(sources)
+        row["error"] = "\n".join(filter(None, (row.get("error"), error)))
+        return row
+
+    def answer_one(
+        position: int,
+        item: tuple[str, str],
+    ) -> tuple[int, str, dict[str, str]]:
         identifier, question = item
-        del identifier  # The ID is written by the caller in the original order.
         print(
             f"Question {position + 1}/{len(questions)}: retrieving"
             + (" and reranking..." if use_reranker else "..."),
             file=sys.stderr,
             flush=True,
         )
+        diagramm_row: dict[str, str] | None = None
+        diagnostic_error = ""
+        hybrid_error = ""
         try:
-            result = rag.answer(
+            diagnostic = collect_diagnostic_result(
+                identifier,
                 question,
-                search_mode="hybrid",
-                retrieve_k=retrieve_k,
-                top_k=final_context_top_k,
-                rrf_top_k=rrf_top_k,
-                use_reranker=use_reranker,
+                rag.index,
+                rag.embedding_client,
+                rag.reranker if use_reranker else None,
+                faiss_top_k=diagramm_faiss_top_k,
+                bm25_top_k=diagramm_bm25_top_k,
+                rrf_top_k=diagramm_rrf_top_k,
+                reranker_input_top_k=diagramm_reranker_input_k,
+                reranker_top_k=diagramm_reranker_top_k,
+                final_context_top_k=diagramm_final_context_top_k,
+                rrf_semantic_weight=rag.semantic_weight,
+                rrf_bm25_weight=rag.lexical_weight,
             )
-            return position, _single_line_answer(result.answer)
+            diagramm_row = diagnostic.row
+            print(
+                f"Question {position + 1}/{len(questions)}: calling LLM with "
+                f"{len(diagnostic.final_hits)} chunks",
+                file=sys.stderr,
+                flush=True,
+            )
+            answer = rag.llm.generate(question, diagnostic.final_hits)
+            return position, _single_line_answer(answer), diagramm_row
         except Exception as exc:
+            diagnostic_error = str(exc)
             print(f"Question {position}: RAG request failed: {exc}", file=sys.stderr)
             if use_reranker:
                 print(f"Question {position}: retrying without reranker", file=sys.stderr)
@@ -1234,12 +1082,17 @@ def run_platform_submission() -> Path:
                 question,
                 search_mode="hybrid",
                 retrieve_k=retrieve_k,
-                top_k=final_context_top_k,
+                top_k=diagramm_final_context_top_k,
                 rrf_top_k=rrf_top_k,
                 use_reranker=False,
             )
-            return position, _single_line_answer(rag.llm.generate(question, sources))
+            answer = rag.llm.generate(question, sources)
+            row = diagramm_row or empty_diagramm_row(identifier, question, "")
+            return position, _single_line_answer(answer), record_actual_context(
+                row, sources, diagnostic_error
+            )
         except Exception as exc:
+            hybrid_error = str(exc)
             print(f"Question {position}: fallback hybrid request failed: {exc}", file=sys.stderr)
 
         try:
@@ -1247,16 +1100,32 @@ def run_platform_submission() -> Path:
                 question,
                 search_mode="bm25",
                 retrieve_k=retrieve_k,
-                top_k=final_context_top_k,
+                top_k=diagramm_final_context_top_k,
                 rrf_top_k=rrf_top_k,
                 use_reranker=False,
             )
-            return position, _single_line_answer(rag.llm.generate(question, sources))
+            answer = rag.llm.generate(question, sources)
+            row = diagramm_row or empty_diagramm_row(
+                identifier, question, diagnostic_error
+            )
+            return position, _single_line_answer(answer), record_actual_context(
+                row, sources, hybrid_error
+            )
         except Exception as exc:
             print(f"Question {position}: fallback request failed: {exc}", file=sys.stderr)
-            return position, "Не удалось получить ответ."
+            return (
+                position,
+                "Не удалось получить ответ.",
+                diagramm_row
+                or empty_diagramm_row(
+                    identifier,
+                    question,
+                    diagnostic_error or hybrid_error or str(exc),
+                ),
+            )
 
     answers = ["Не удалось получить ответ."] * len(questions)
+    diagramm_rows: list[dict[str, str] | None] = [None] * len(questions)
     max_workers = _platform_int("MAX_WORKERS", 1, 1, 8)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
@@ -1264,16 +1133,33 @@ def run_platform_submission() -> Path:
             for position, item in enumerate(questions)
         ]
         for future in as_completed(futures):
-            position, answer = future.result()
+            position, answer, diagramm_row = future.result()
             answers[position] = answer
+            diagramm_rows[position] = diagramm_row
 
-    output_path = Path(_platform_env("OUTPUT_PATH", "submission.csv")).expanduser().resolve()
     with output_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, quoting=csv.QUOTE_ALL, lineterminator="\n")
         writer.writerow(["id", "answer"])
         for (identifier, _), answer in zip(questions, answers):
             writer.writerow([identifier, answer])
     print(f"Записано {len(answers)} ответов в {output_path}", file=sys.stderr)
+
+    with diagramm_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=diagramm_columns,
+            quoting=csv.QUOTE_ALL,
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        for position, (identifier, question) in enumerate(questions):
+            row = diagramm_rows[position] or empty_diagramm_row(
+                identifier,
+                question,
+                "Диагностические данные не были собраны.",
+            )
+            writer.writerow({column: row.get(column, "") for column in diagramm_columns})
+    print(f"Диагностика записана в {diagramm_path}", file=sys.stderr)
     return output_path
 
 

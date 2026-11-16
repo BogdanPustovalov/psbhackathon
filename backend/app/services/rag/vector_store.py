@@ -12,9 +12,9 @@ from typing import Any
 import warnings
 
 from . import (
-    BM25_PROTECTED_TOP_K,
     BM25_TOP_K,
-    FAISS_PROTECTED_TOP_K,
+    BM25_WEIGHT,
+    FAISS_WEIGHT,
     FAISS_TOP_K,
     RRF_TOP_K,
     Document,
@@ -24,7 +24,7 @@ from .embedding import EmbeddingClient
 
 @dataclass(slots=True)
 class HybridSearchTrace:
-    """Ranked source lists, plain RRF list, and the protected reranker pool."""
+    """Ranked source lists and the weighted RRF pool sent to the reranker."""
 
     faiss_hits: list[Document]
     bm25_hits: list[Document]
@@ -352,25 +352,16 @@ class FaissVectorIndex:
         top_k: int = RRF_TOP_K,
         faiss_k: int = FAISS_TOP_K,
         bm25_k: int = BM25_TOP_K,
-        faiss_protected_k: int = FAISS_PROTECTED_TOP_K,
-        bm25_protected_k: int = BM25_PROTECTED_TOP_K,
         rrf_k: int = 60,
-        semantic_weight: float = 1.0,
-        lexical_weight: float = 1.0,
+        semantic_weight: float = FAISS_WEIGHT,
+        lexical_weight: float = BM25_WEIGHT,
     ) -> HybridSearchTrace:
-        """Merge both source lists by chunk ID and retain their original signals.
-
-        Source Top-K hits replace the lowest RRF hits when the reranker pool
-        is full. BM25 retention is provisional until relevance confirmation.
-        ``rrf_hits`` remains the unmodified RRF Top-K.
-        """
+        """Fuse FAISS and BM25 ranks using weighted RRF, then take Top-K."""
 
         if not isinstance(query, str):
             raise TypeError("Ошибка! query должен быть строкой")
         if min(top_k, faiss_k, bm25_k, rrf_k) <= 0:
             raise ValueError("top_k, faiss_k, bm25_k и rrf_k должны быть положительными")
-        if min(faiss_protected_k, bm25_protected_k) < 0:
-            raise ValueError("protected Top-K не может быть отрицательным")
         if (
             not math.isfinite(semantic_weight)
             or not math.isfinite(lexical_weight)
@@ -427,18 +418,6 @@ class FaissVectorIndex:
         for rank, chunk_id in enumerate(ranked_ids, start=1):
             signals[chunk_id]["rrf_rank"] = rank
 
-        protected_faiss = set(source_order["faiss"][:faiss_protected_k])
-        protected_bm25 = set(source_order["bm25"][:bm25_protected_k])
-        protected = protected_faiss | protected_bm25
-        if len(protected) > top_k:
-            raise ValueError("RRF pool is too small to retain protected source hits")
-
-        selected = set(protected)
-        for chunk_id in ranked_ids:
-            if len(selected) >= top_k:
-                break
-            selected.add(chunk_id)
-
         def as_document(chunk_id: str, score: float) -> Document:
             signal = signals[chunk_id]
             document = self._result(signal["index"], score)
@@ -451,12 +430,9 @@ class FaissVectorIndex:
                 rrf_rank=signal["rrf_rank"],
                 rrf_score=signal["rrf_score"],
                 rrf_normalized=signal["rrf_normalized"],
-                protected_by=[
-                    name for name, matches in (
-                        ("faiss", chunk_id in protected_faiss),
-                        ("bm25", chunk_id in protected_bm25),
-                    ) if matches
-                ],
+                rrf_k=rrf_k,
+                rrf_faiss_weight=semantic_weight,
+                rrf_bm25_weight=lexical_weight,
             )
             return document
 
@@ -475,7 +451,7 @@ class FaissVectorIndex:
             ],
             candidates=[
                 as_document(chunk_id, signals[chunk_id]["rrf_score"])
-                for chunk_id in ranked_ids if chunk_id in selected
+                for chunk_id in ranked_ids[:top_k]
             ],
         )
 
@@ -487,10 +463,10 @@ class FaissVectorIndex:
         top_k: int = RRF_TOP_K,
         candidate_k: int = FAISS_TOP_K,
         rrf_k: int = 60,
-        semantic_weight: float = 1.0,
-        lexical_weight: float = 1.0,
+        semantic_weight: float = FAISS_WEIGHT,
+        lexical_weight: float = BM25_WEIGHT,
     ) -> list[Document]:
-        """Return the protected RRF pool for callers that only need documents."""
+        """Return the weighted RRF pool for callers that only need documents."""
 
         return self.hybrid_candidates(
             query,
@@ -498,8 +474,6 @@ class FaissVectorIndex:
             top_k=top_k,
             faiss_k=candidate_k,
             bm25_k=candidate_k,
-            faiss_protected_k=min(FAISS_PROTECTED_TOP_K, top_k // 2),
-            bm25_protected_k=min(BM25_PROTECTED_TOP_K, top_k // 2),
             rrf_k=rrf_k,
             semantic_weight=semantic_weight,
             lexical_weight=lexical_weight,

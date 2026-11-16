@@ -1,23 +1,12 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-import csv
+import os
+import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from importlib import import_module
-import io
-import math
-import os
-import re
-import sys
-import time
-from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Iterable
-import zipfile
-from xml.etree import ElementTree as ET
-
-import httpx
+from typing import Any
 
 try:
     from dotenv import load_dotenv
@@ -117,7 +106,12 @@ def _with_score(document: Any, score: float) -> Any:
 
 
 if __package__:
-    from .embedding import EmbeddingAPIError, EmbeddingClient, EmbeddingProvider, OpenAIEmbeddingProvider
+    from .embedding import (
+        EmbeddingAPIError,
+        EmbeddingClient,
+        EmbeddingProvider,
+        OpenAIEmbeddingProvider,
+    )
     from .llm import LLMAPIError, OpenAICompatibleLLM
     from .reranker import Reranker
     from .vector_store import FaissVectorIndex, build_faiss_index, embed_and_index
@@ -127,7 +121,12 @@ else:
     if package_parent not in sys.path:
         sys.path.insert(0, package_parent)
 
-    from app.services.rag.embedding import EmbeddingAPIError, EmbeddingClient, EmbeddingProvider, OpenAIEmbeddingProvider
+    from app.services.rag.embedding import (
+        EmbeddingAPIError,
+        EmbeddingClient,
+        EmbeddingProvider,
+        OpenAIEmbeddingProvider,
+    )
     from app.services.rag.llm import LLMAPIError, OpenAICompatibleLLM
     from app.services.rag.reranker import Reranker
     from app.services.rag.vector_store import FaissVectorIndex, build_faiss_index, embed_and_index
@@ -157,26 +156,26 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "Document",
-    "Reranker",
-    "RerankerError",
-    "EmbeddingProvider",
-    "OpenAIEmbeddingProvider",
-    "EmbeddingClient",
     "EmbeddingAPIError",
-    "OpenAICompatibleLLM",
-    "LLMAPIError",
+    "EmbeddingClient",
+    "EmbeddingProvider",
     "FaissVectorIndex",
+    "LLMAPIError",
+    "OpenAICompatibleLLM",
+    "OpenAIEmbeddingProvider",
     "RAGResult",
     "RAGSystem",
-    "load_documents",
-    "split_into_chunks",
-    "split_documents",
+    "Reranker",
+    "RerankerError",
     "build_faiss_index",
     "embed_and_index",
     "load_and_index",
-    "search_and_rerank",
-    "rerank_documents",
     "load_and_rerank",
-    "run_platform_submission",
+    "load_documents",
     "main",
+    "rerank_documents",
+    "run_platform_submission",
+    "search_and_rerank",
+    "split_documents",
+    "split_into_chunks",
 ]

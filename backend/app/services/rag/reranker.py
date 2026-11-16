@@ -56,7 +56,7 @@ class Reranker:
     def is_loaded(self) -> bool:
         return self._model is not None
 
-    def load(self) -> "Reranker":
+    def load(self) -> Reranker:
         """Load Qwen locally only when it is first needed."""
         with self._model_lock:
             if self._model is not None:

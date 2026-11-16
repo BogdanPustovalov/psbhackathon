@@ -6,16 +6,15 @@ import csv
 import json
 import math
 import os
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
-from app.services.rag import Document
+from app.services.rag import Document, pipeline
 from app.services.rag.diagnostic import collect_diagnostic_result
 from app.services.rag.llm import OpenAICompatibleLLM
 from app.services.rag.pipeline import rank_hybrid_candidates
-from app.services.rag import pipeline
 from app.services.rag.vector_store import FaissVectorIndex
 
 

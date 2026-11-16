@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 import math
 import sys
-from collections.abc import Mapping, Sequence
+from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -143,7 +143,7 @@ class EmbeddingClient:
         self._model: Any | None = None
         self._lock = RLock()
 
-    def load(self) -> "EmbeddingClient":
+    def load(self) -> EmbeddingClient:
         with self._lock:
             if self._model is not None:
                 return self

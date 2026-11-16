@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import sys
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 
 if __package__ in {None, ""}:
@@ -193,7 +194,7 @@ def collect_diagnostic_result(
         bm25_hits = trace.bm25_hits
         rrf_hits = trace.rrf_hits
         reranker_input = trace.candidates[:reranker_input_top_k]
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - record retrieval failure in diagnostics
         errors.append(_short_error("Hybrid retrieval", exc))
     else:
         try:
@@ -205,7 +206,7 @@ def collect_diagnostic_result(
                 reranker_input_k=reranker_input_top_k,
                 reranker_output_k=reranker_top_k,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - keep the diagnostic fallback available
             errors.append(_short_error("Qwen Reranker", exc))
             ranking = rank_hybrid_candidates(
                 question,
@@ -292,7 +293,7 @@ def write_diagnostics(
     index_error = ""
     try:
         index = embed_and_index(chunks, embedding_client)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - fall back to BM25 for any index failure
         index_error = _short_error("Embedding fallback to BM25", exc)
         print(index_error, file=sys.stderr)
         index = FaissVectorIndex()

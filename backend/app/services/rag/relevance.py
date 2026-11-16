@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import date
-from functools import lru_cache
 import re
 import unicodedata
+from datetime import date
+from functools import lru_cache
 from typing import Any
 
 
@@ -16,8 +16,8 @@ _MONTHS = {
 }
 _MONTH_NAMES = "|".join(_MONTHS)
 _DATE_TEXT = rf"(?:\d{{1,2}}\.\d{{1,2}}\.\d{{4}}|\d{{1,2}}\s+(?:{_MONTH_NAMES})\s+\d{{4}})"
-_DATE_RE = re.compile(_DATE_TEXT, re.I)
-_CONTRACT_RE = re.compile(r"(?<!\w)[а-яa-z]{1,5}[-–]?\d{1,4}[/.\-]\d{4}(?!\w)", re.I)
+_DATE_RE = re.compile(_DATE_TEXT, re.IGNORECASE)
+_CONTRACT_RE = re.compile(r"(?<!\w)[а-яa-z]{1,5}[-–]?\d{1,4}[/.\-]\d{4}(?!\w)", re.IGNORECASE)
 _ARTICLE_RE = re.compile(r"(?i)\b(?:статья|статьи|ст\.)\s*№?\s*(\d+(?:\.\d+)?)")
 _CLAUSE_RE = re.compile(r"(?i)\b(?:пункт|пункта|п\.)\s*(\d+(?:\.\d+)+)")
 _AI_CUE_RE = re.compile(r"(?i)\b(?:ии|ai|ассистент|модель|модели|нейросеть|нейросети)\b")

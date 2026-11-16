@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass, field
 import hashlib
 import io
 import math
@@ -9,11 +8,12 @@ import os
 import re
 import sys
 import uuid
+import zipfile
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-import zipfile
 from xml.etree import ElementTree as ET
 
 from . import (
@@ -34,6 +34,7 @@ from .llm import OpenAICompatibleLLM
 from .relevance import document_temporal_metadata
 from .reranker import Reranker
 from .vector_store import FaissVectorIndex, HybridSearchTrace, embed_and_index
+
 
 def _clean_text(text: str) -> str:
     """..."""
@@ -190,7 +191,7 @@ def _structured_chunks(
         re.finditer(
             r"\S.*?(?=\n\s*\n|\n(?=(?:\d+(?:\.\d+)*[.)]\s+|статья\s+\d+|раздел\s+[IVX\d]+))|\Z)",
             text,
-            flags=re.S | re.I,
+            flags=re.DOTALL | re.IGNORECASE,
         )
     )
     if not paragraphs:
@@ -458,7 +459,7 @@ def rank_hybrid_candidates(
         raise ValueError("Reranker did not return all unique RRF candidates")
     for rank, doc in enumerate(reranked, start=1):
         if not isinstance(doc, Document):
-            raise ValueError("Reranker returned an invalid document")
+            raise TypeError("Reranker returned an invalid document")
         chunk_id = str(doc.metadata.get("chunk_id"))
         if chunk_id not in expected or chunk_id in seen:
             raise ValueError("Reranker returned an unknown or duplicate chunk")
@@ -972,7 +973,7 @@ def run_platform_submission() -> Path:
     try:
         indexed = rag.ingest(documents)
         print(f"Индексировано {indexed} фрагментов с встраиванием", file=sys.stderr)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - preserve the BM25 fallback
         # The README requires embedding failures to degrade to a simpler search.
         print(f"Встраивание недоступно; использование fallback BM25: {exc}", file=sys.stderr)
         rag.clear()
@@ -981,11 +982,8 @@ def run_platform_submission() -> Path:
 
     # Keep the diagnostic pass and answer generation on the same retrieval
     # result. This avoids embedding/reranking every question twice.
-    from .diagnostic import (
-        _column_names as _diagnostic_column_names,
-        _documents_json,
-        collect_diagnostic_result,
-    )
+    from .diagnostic import _column_names as _diagnostic_column_names
+    from .diagnostic import _documents_json, collect_diagnostic_result
 
     diagramm_faiss_top_k = retrieve_k
     diagramm_bm25_top_k = retrieve_k
@@ -1071,7 +1069,7 @@ def run_platform_submission() -> Path:
             )
             answer = rag.llm.generate(question, diagnostic.final_hits)
             return position, _single_line_answer(answer), diagramm_row
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - continue through fallback stages
             diagnostic_error = str(exc)
             print(f"Question {position}: RAG request failed: {exc}", file=sys.stderr)
             if use_reranker:
@@ -1091,7 +1089,7 @@ def run_platform_submission() -> Path:
             return position, _single_line_answer(answer), record_actual_context(
                 row, sources, diagnostic_error
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - continue through fallback stages
             hybrid_error = str(exc)
             print(f"Question {position}: fallback hybrid request failed: {exc}", file=sys.stderr)
 
@@ -1111,7 +1109,7 @@ def run_platform_submission() -> Path:
             return position, _single_line_answer(answer), record_actual_context(
                 row, sources, hybrid_error
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - return the failed row to the caller
             print(f"Question {position}: fallback request failed: {exc}", file=sys.stderr)
             return (
                 position,

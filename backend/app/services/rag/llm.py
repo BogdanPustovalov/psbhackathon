@@ -8,6 +8,7 @@ import httpx
 
 from . import Document, _env, _first_env
 
+
 class LLMAPIError(RuntimeError):
     """..."""
 

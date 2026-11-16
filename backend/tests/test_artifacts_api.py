@@ -1,10 +1,12 @@
-from fastapi.testclient import TestClient
 from unittest.mock import patch
+
+from fastapi.testclient import TestClient
 
 from app.api.routes.query import get_pipeline
 from app.main import app
 from app.services.pipeline import ExtractiveLLM, RAGPipeline, get_corpus
 from app.services.rag.embedding import EmbeddingAPIError
+
 
 
 client = TestClient(app)

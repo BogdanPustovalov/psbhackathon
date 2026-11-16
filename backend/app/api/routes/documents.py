@@ -1,3 +1,5 @@
+from typing import Annotated
+
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from app.models.schemas import DocumentDetail, DocumentInfo, IngestResponse
@@ -20,7 +22,7 @@ def get_document(doc_id: str) -> DocumentDetail:
 
 
 @router.post("/ingest", response_model=IngestResponse)
-async def ingest_documents(files: list[UploadFile] = File(...)) -> IngestResponse:
+async def ingest_documents(files: Annotated[list[UploadFile], File()]) -> IngestResponse:
     names = [file.filename or "unnamed" for file in files]
     # TODO: передать файлы в асинхронную очередь ingestion worker.
     return IngestResponse(

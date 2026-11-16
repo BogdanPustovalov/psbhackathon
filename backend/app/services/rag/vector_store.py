@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import math
 import os
 import re
 import unicodedata
+import warnings
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
-import warnings
 
 from . import (
     BM25_TOP_K,
     BM25_WEIGHT,
-    FAISS_WEIGHT,
     FAISS_TOP_K,
+    FAISS_WEIGHT,
     RRF_TOP_K,
     Document,
 )
@@ -227,7 +227,7 @@ class FaissVectorIndex:
         self._bm25_terms = [set(tokens) for tokens in corpus]
 
     @classmethod
-    def from_prebuilt(cls, documents: Iterable[Document], index_path: str) -> "FaissVectorIndex":
+    def from_prebuilt(cls, documents: Iterable[Document], index_path: str) -> FaissVectorIndex:
         """Attach a saved FAISS index to the matching chunk list and build BM25."""
         import faiss
 
